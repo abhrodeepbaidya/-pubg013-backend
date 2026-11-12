@@ -1433,6 +1433,44 @@ def reset_ranked_season(season_id: str, next_season_id: str = Query(min_length=1
     return {"status":"season_reset","previous_season":season_id,"new_season":next_season_id,"players_reset":len(rows)}
 
 
+# TDM Factory/Depot map package registration.
+# The referenced PAK is kept outside this backend repository; this endpoint records
+# verified internal asset paths and does not claim that the map is extracted/playable.
+TDM_FACTORY_MAP_ASSET = {
+    "map_id": "tdm_factory_depot",
+    "display_name": "TDM Factory / Depot",
+    "mode": "team_deathmatch",
+    "package_file": "map_tdfactory_obb.pak",
+    "asset_status": "identified_not_extracted",
+    "identified_assets": [
+        "TD_Factory_Depot_Mian.umap",
+        "TD_Factory_Depot_Camp_ResultAvatar.umap",
+        "Test.umap",
+    ],
+    "additional_asset_prefixes": ["TD_Logging_Camp"],
+    "integration_note": (
+        "Map package registered for the client integration stage. "
+        "The PAK binary is not stored in this backend repository; "
+        "UE project extraction/import and map validation are still required."
+    ),
+}
+
+@app.get("/maps/catalog")
+def map_catalog():
+    return {
+        "maps": [
+            {"map_id": "erangel", "display_name": "Erangel", "mode": "classic_battle_royale",
+             "asset_status": "client_assets_not_verified"},
+            {key: value for key, value in TDM_FACTORY_MAP_ASSET.items()
+             if key in {"map_id", "display_name", "mode", "asset_status"}},
+        ]
+    }
+
+@app.get("/maps/tdm-factory/config")
+def tdm_factory_map_config():
+    return TDM_FACTORY_MAP_ASSET
+
+
 # v10 building loot presets: randomized classic-era inspired indoor loot.
 BUILDING_LOOT_TABLES = {
     "small_house": [
