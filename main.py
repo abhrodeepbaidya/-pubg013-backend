@@ -10,7 +10,7 @@ from typing import Literal
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Battle Royale Backend", version="7.0.0")
+app = FastAPI(title="Battle Royale Backend", version="8.0.0")
 DB_PATH = Path(__file__).resolve().parent / "game.db"
 
 BASE_CAPACITY = 20
@@ -902,6 +902,7 @@ def systems_status():
             "match_join_leave": "prototype_no_matchmaking",
             "BP_UC_crates_coupons": "prototype_wallet_crates_and_cosmetic_collection",
             "erangel_spawn_timer_zone_results": "classic_timing_prototype_for_ue4_client",
+            "throwable_pin_cook_cancel_audio": "prototype_action_api_for_ue4_client",
         },
     }
 
@@ -1202,3 +1203,112 @@ def get_erangel_result(match_id: str):
         raise HTTPException(404,"Match result not available")
     return json.loads(row[0])
 
+
+
+# v8 throwable handling: pin audio events, frag cooking, cancel and impact effects.
+THROWABLE_PROFILES = {
+    "frag_grenade": {"pin_sound":"frag_pin_pull","pin_audible_radius_m":20,"fuse_seconds":5.0,"cookable":True,"detonate_on_impact":False,"effect":"explosion"},
+    "smoke_grenade": {"pin_sound":"smoke_pin_pull","pin_audible_radius_m":20,"fuse_seconds":1.0,"cookable":False,"detonate_on_impact":True,"effect":"smoke_cloud"},
+    "molotov": {"pin_sound":"molotov_prepare","pin_audible_radius_m":20,"fuse_seconds":0.0,"cookable":False,"detonate_on_impact":True,"effect":"fire_area"},
+}
+THROWABLE_ACTIONS = {}
+
+class ThrowableActionInput(BaseModel):
+    item_id: Literal["frag_grenade","smoke_grenade","molotov"]
+    action_id: str = Field(min_length=1,max_length=64)
+
+@app.get("/throwables/config")
+def throwables_config():
+    return {
+        "profiles": THROWABLE_PROFILES,
+        "frag_cooking": {"total_fuse_seconds":5.0,"cook_starts_on_pin_pull":True,"cancel_after_cooking_starts":False},
+        "audio": {"pin_pull_event":"play_for_nearby_clients","audible_radius_m":20},
+        "cancel": {"allowed_before_pin_pull":True,"allowed_after_pin_pull_before_fuse":True,"allowed_after_cooking_starts":False},
+        "note":"Prototype tuning. UE4 client must render throw animations, pin audio, fuse UI, projectile physics, smoke and fire effects."
+    }
+
+@app.post("/player/{player_id}/throwable/begin")
+def begin_throwable_action(player_id: str, data: ThrowableActionInput):
+    state = ensure_v4_state(get_player(player_id))
+    if data.action_id in THROWABLE_ACTIONS:
+        raise HTTPException(409,"Throwable action already exists")
+    if state["throwables"].get(data.item_id,0) < 1:
+        raise HTTPException(400,"Throwable not available")
+    profile = THROWABLE_PROFILES[data.item_id]
+    now = time.time()
+    action = {
+        "action_id":data.action_id,"player_id":player_id,"item_id":data.item_id,
+        "status":"aiming","started_at":now,"pin_pulled_at":None,
+        "fuse_ends_at":None,"cookable":profile["cookable"]
+    }
+    THROWABLE_ACTIONS[data.action_id] = action
+    return {"status":"throwable_selected","action":action,"audio_event":None}
+
+@app.post("/player/{player_id}/throwable/{action_id}/pull-pin")
+def pull_throwable_pin(player_id: str, action_id: str):
+    action = THROWABLE_ACTIONS.get(action_id)
+    if action is None or action["player_id"] != player_id:
+        raise HTTPException(404,"Throwable action not found")
+    if action["status"] != "aiming":
+        raise HTTPException(409,"Pin cannot be pulled in the current state")
+    profile = THROWABLE_PROFILES[action["item_id"]]
+    now = time.time()
+    action["pin_pulled_at"] = now
+    action["status"] = "cooking" if profile["cookable"] else "ready_to_throw"
+    action["fuse_ends_at"] = now + profile["fuse_seconds"] if profile["cookable"] else None
+    return {
+        "status":action["status"],"action":action,
+        "audio_event":{"name":profile["pin_sound"],"audible_radius_m":profile["pin_audible_radius_m"]},
+        "fuse_seconds":profile["fuse_seconds"] if profile["cookable"] else None
+    }
+
+@app.post("/player/{player_id}/throwable/{action_id}/cancel")
+def cancel_throwable_action(player_id: str, action_id: str):
+    action = THROWABLE_ACTIONS.get(action_id)
+    if action is None or action["player_id"] != player_id:
+        raise HTTPException(404,"Throwable action not found")
+    if action["status"] == "cooking":
+        raise HTTPException(409,"Cannot cancel after frag fuse has started; throw it")
+    if action["status"] not in {"aiming","ready_to_throw"}:
+        raise HTTPException(409,"Throwable action cannot be cancelled")
+    action["status"] = "cancelled"
+    del THROWABLE_ACTIONS[action_id]
+    return {"status":"cancelled","item_id":action["item_id"],"inventory_consumed":False}
+
+@app.post("/player/{player_id}/throwable/{action_id}/throw")
+def release_throwable_action(player_id: str, action_id: str):
+    action = THROWABLE_ACTIONS.get(action_id)
+    if action is None or action["player_id"] != player_id:
+        raise HTTPException(404,"Throwable action not found")
+    if action["status"] not in {"cooking","ready_to_throw"}:
+        raise HTTPException(409,"Pull the pin or prepare the throwable first")
+    now = time.time()
+    if action["fuse_ends_at"] is not None and now >= action["fuse_ends_at"]:
+        action["status"] = "detonated_in_hand"
+        raise HTTPException(409,"Frag fuse expired before release")
+    state = ensure_v4_state(get_player(player_id))
+    item_id = action["item_id"]
+    if state["throwables"].get(item_id,0) < 1:
+        raise HTTPException(400,"Throwable inventory changed")
+    state["throwables"][item_id] -= 1
+    save_player(player_id,state)
+    profile = THROWABLE_PROFILES[item_id]
+    elapsed = round(now-action["pin_pulled_at"],2) if action["pin_pulled_at"] else 0
+    result = {
+        "status":"thrown","item_id":item_id,"cook_elapsed_seconds":elapsed,
+        "remaining_fuse_seconds":max(0,round(profile["fuse_seconds"]-elapsed,2)) if profile["cookable"] else None,
+        "impact_effect":profile["effect"],"detonate_on_impact":profile["detonate_on_impact"],
+        "inventory_remaining":state["throwables"][item_id]
+    }
+    del THROWABLE_ACTIONS[action_id]
+    return result
+
+@app.get("/player/{player_id}/throwable/{action_id}")
+def throwable_action_state(player_id: str, action_id: str):
+    action = THROWABLE_ACTIONS.get(action_id)
+    if action is None or action["player_id"] != player_id:
+        raise HTTPException(404,"Throwable action not found")
+    remaining = None
+    if action["fuse_ends_at"] is not None:
+        remaining = max(0,round(action["fuse_ends_at"]-time.time(),2))
+    return {"action":action,"fuse_remaining_seconds":remaining}
