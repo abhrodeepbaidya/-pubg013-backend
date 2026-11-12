@@ -369,10 +369,29 @@ def backpack(player_id: str, data: LevelInput):
 
 @app.put("/player/{player_id}/vest")
 def vest(player_id: str, data: LevelInput):
-    state = get_player(player_id)
+    state = ensure_v4_state(get_player(player_id))
     state["vest_level"] = data.level
+    state["armor"]["vest_durability"] = VEST_DURABILITY[data.level]
     save_player(player_id, state)
-    return {"status": "equipped", "level": data.level, "capacity": max_capacity(state)}
+    return {
+        "status": "vest_equipped",
+        "level": data.level,
+        "durability": state["armor"]["vest_durability"],
+        "capacity": max_capacity(state),
+    }
+
+
+@app.put("/player/{player_id}/helmet")
+def helmet(player_id: str, data: LevelInput):
+    state = ensure_v4_state(get_player(player_id))
+    state["armor"]["helmet_level"] = data.level
+    state["armor"]["helmet_durability"] = HELMET_DURABILITY[data.level]
+    save_player(player_id, state)
+    return {
+        "status": "helmet_equipped",
+        "level": data.level,
+        "durability": state["armor"]["helmet_durability"],
+    }
 
 
 @app.post("/player/{player_id}/item")
