@@ -10,7 +10,7 @@ from typing import Literal
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Battle Royale Backend", version="4.0.0")
+app = FastAPI(title="Battle Royale Backend", version="5.0.0")
 DB_PATH = Path(__file__).resolve().parent / "game.db"
 
 BASE_CAPACITY = 20
@@ -108,6 +108,7 @@ def init_db():
             "player_id TEXT PRIMARY KEY, uid TEXT NOT NULL UNIQUE, "
             "username TEXT NOT NULL, username_key TEXT NOT NULL UNIQUE)"
         )
+        con.execute("CREATE TABLE IF NOT EXISTS kill_feed (id INTEGER PRIMARY KEY AUTOINCREMENT, match_id TEXT NOT NULL, killer_id TEXT NOT NULL, victim_id TEXT NOT NULL, weapon_id TEXT NOT NULL, hit_zone TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
 
 
 def fresh_player():
@@ -784,13 +785,111 @@ def match_players(match_id: str):
     return {"match_id": match_id, "players": players, "count": len(players)}
 
 
+
+# v5 combat and presentation configuration for the UE4 client
+WEAPON_DAMAGE = {"M416":41,"AKM":48,"SCAR-L":41,"M16A4":41,"AUG A3":41,"Groza":48,"QBZ":41,"UMP9":35,"UMP45":39,"UZI":26,"Vector":31,"Tommy Gun":40,"Kar98k":75,"M24":79,"AWM":105,"Win94":66,"Mini14":46,"SKS":53,"Mk14":61,"QBU":48,"DP-28":51,"M249":45,"S1897":25,"S686":25,"S12K":22,"P92":35,"P18C":23,"P1911":41,"R1895":55,"R45":55,"Sawed-off":22,"Crossbow":100}
+RECOIL_PROFILES = {name: {"vertical":1.0,"horizontal":0.35,"camera_shake":0.25,"recovery":0.8,"hip_spread":1.0} for name in WEAPON_DAMAGE}
+for name in ("AKM","Groza"):
+    RECOIL_PROFILES[name] = {"vertical":1.45,"horizontal":0.65,"camera_shake":0.45,"recovery":0.55,"hip_spread":1.25}
+for name in ("UZI","Vector","P18C"):
+    RECOIL_PROFILES[name] = {"vertical":0.65,"horizontal":0.25,"camera_shake":0.18,"recovery":1.1,"hip_spread":0.85}
+SCOPE_NAMES = ["hip","red_dot","holographic","2x","3x","4x","6x","8x"]
+HIT_MULTIPLIERS = {"head":2.0,"body":1.0,"limbs":0.75}
+RANGE_FALLOFF = {"AR":0.0012,"SMG":0.0028,"Sniper":0.00025,"DMR":0.0008,"LMG":0.001,"Pistol":0.002,"Shotgun":0.004,"Special":0.0002}
+
+class CombatHitInput(BaseModel):
+    match_id: str = Field(min_length=1,max_length=64)
+    shooter_id: str = Field(min_length=1,max_length=64)
+    target_id: str = Field(min_length=1,max_length=64)
+    weapon_id: str
+    hit_zone: Literal["head","body","limbs"] = "body"
+    distance_m: float = Field(default=10,ge=0,le=2000)
+    shots: int = Field(default=1,ge=1,le=10)
+
+class MovementInput(BaseModel):
+    stance: Literal["standing","crouching","prone","swimming"] = "standing"
+    is_sprinting: bool = False
+    is_jumping: bool = False
+    is_climbing: bool = False
+
+class AimInput(BaseModel):
+    scope: Literal["hip","red_dot","holographic","2x","3x","4x","6x","8x"] = "hip"
+    is_ads: bool = False
+    sensitivity: int = Field(default=100,ge=1,le=400)
+    gyro_sensitivity: int = Field(default=100,ge=0,le=400)
+
+@app.get("/combat/config")
+def combat_config():
+    return {"version":app.version,"weapon_damage":WEAPON_DAMAGE,"recoil_profiles":RECOIL_PROFILES,"hit_multipliers":HIT_MULTIPLIERS,"scopes":SCOPE_NAMES,"range_falloff":RANGE_FALLOFF,"client_effects":["camera_shake","muzzle_flash","bullet_tracer","hit_marker","red_hit_effect","blood_particle","kill_notification"]}
+
+@app.get("/weapons/{weapon_id}/handling")
+def weapon_handling(weapon_id: str):
+    if weapon_id not in WEAPON_DAMAGE:
+        raise HTTPException(404,"Weapon profile not found")
+    return {"weapon_id":weapon_id,"base_damage":WEAPON_DAMAGE[weapon_id],"recoil":RECOIL_PROFILES[weapon_id],"ammo_type":WEAPONS[weapon_id][1],"magazine_capacity":MAGAZINE_CAPACITY.get(weapon_id,1),"scopes":SCOPE_NAMES}
+
+@app.put("/player/{player_id}/movement")
+def update_movement(player_id: str,data: MovementInput):
+    state = ensure_v4_state(get_player(player_id))
+    state["movement"] = data.model_dump()
+    save_player(player_id,state)
+    return {"status":"movement_updated","movement":state["movement"]}
+
+@app.put("/player/{player_id}/aim")
+def update_aim(player_id: str,data: AimInput):
+    state = ensure_v4_state(get_player(player_id))
+    state["aim"] = data.model_dump()
+    save_player(player_id,state)
+    return {"status":"aim_updated","aim":state["aim"]}
+
+@app.post("/combat/hit")
+def register_combat_hit(data: CombatHitInput):
+    if data.weapon_id not in WEAPON_DAMAGE:
+        raise HTTPException(400,"Unknown weapon damage profile")
+    if data.shooter_id == data.target_id:
+        raise HTTPException(400,"Self damage is not allowed")
+    target = ensure_v4_state(get_player(data.target_id))
+    if target["health"] <= 0:
+        raise HTTPException(409,"Target is already eliminated")
+    category = WEAPONS[data.weapon_id][0]
+    raw_damage = WEAPON_DAMAGE[data.weapon_id] * data.shots * HIT_MULTIPLIERS[data.hit_zone]
+    falloff = max(0.25,1.0-data.distance_m*RANGE_FALLOFF.get(category,0.001))
+    damage = max(1,int(raw_damage*falloff))
+    armor = target["armor"]
+    if data.hit_zone == "head":
+        armor_level = armor.get("helmet_level",0)
+        durability_key = "helmet_durability"
+        reduction = HELMET_REDUCTION.get(armor_level,0)
+    else:
+        armor_level = target.get("vest_level",0)
+        durability_key = "vest_durability"
+        reduction = VEST_REDUCTION.get(armor_level,0) if data.hit_zone == "body" else 0
+    absorbed = min(armor.get(durability_key,0),int(damage*reduction))
+    armor[durability_key] = max(0,armor.get(durability_key,0)-absorbed)
+    health_damage = max(0,damage-absorbed)
+    target["health"] = max(0,target["health"]-health_damage)
+    eliminated = target["health"] == 0
+    save_player(data.target_id,target)
+    if eliminated:
+        with db() as con:
+            con.execute("INSERT INTO kill_feed(match_id,killer_id,victim_id,weapon_id,hit_zone) VALUES(?,?,?,?,?)",(data.match_id,data.shooter_id,data.target_id,data.weapon_id,data.hit_zone))
+    return {"status":"hit_registered","damage":damage,"armor_absorbed":absorbed,"health_damage":health_damage,"target_health":target["health"],"eliminated":eliminated,"effects":{"hit_marker":True,"red_hit_effect":True,"blood_particle":True,"kill_notification":eliminated}}
+
+@app.get("/match/{match_id}/kill-feed")
+def get_kill_feed(match_id: str,limit: int = Query(default=20,ge=1,le=100)):
+    with db() as con:
+        rows = con.execute("SELECT killer_id,victim_id,weapon_id,hit_zone,created_at FROM kill_feed WHERE match_id=? ORDER BY id DESC LIMIT ?",(match_id,limit)).fetchall()
+    return {"match_id":match_id,"events":[{"killer_id":r[0],"victim_id":r[1],"weapon_id":r[2],"hit_zone":r[3],"created_at":r[4]} for r in rows]}
+
 @app.get("/systems")
 def systems_status():
     return {
         "version": app.version,
         "systems": {
             "players_inventory": "available",
-            "weapons_attachments_ammo": "available",
+            "weapons_attachments_ammo": "expanded_classic_catalogue",
+            "combat_recoil_aim": "prototype_config_for_ue4_client",
+            "hit_detection_kill_feed": "prototype_server_api",
             "healing_boost": "available",
             "armor_damage": "prototype",
             "throwables": "prototype",
