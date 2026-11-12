@@ -10,7 +10,7 @@ from typing import Literal
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Battle Royale Backend", version="8.0.0")
+app = FastAPI(title="Battle Royale Backend", version="9.0.0")
 DB_PATH = Path(__file__).resolve().parent / "game.db"
 
 BASE_CAPACITY = 20
@@ -903,6 +903,7 @@ def systems_status():
             "BP_UC_crates_coupons": "prototype_wallet_crates_and_cosmetic_collection",
             "erangel_spawn_timer_zone_results": "classic_timing_prototype_for_ue4_client",
             "throwable_pin_cook_cancel_audio": "prototype_action_api_for_ue4_client",
+            "classic_ranked_tiers_leaderboard": "prototype_per_queue_ranked_progression",
         },
     }
 
@@ -1312,3 +1313,118 @@ def throwable_action_state(player_id: str, action_id: str):
     if action["fuse_ends_at"] is not None:
         remaining = max(0,round(action["fuse_ends_at"]-time.time(),2))
     return {"action":action,"fuse_remaining_seconds":remaining}
+
+
+# v9 classic ranked progression, per-queue rating, divisions and top-500 leaderboard.
+RANKED_QUEUES = ["solo_tpp","solo_fpp","duo_tpp","duo_fpp","squad_tpp","squad_fpp"]
+TIER_BANDS = [
+    ("Bronze",1200,1699),("Silver",1700,2199),("Gold",2200,2699),
+    ("Platinum",2700,3199),("Diamond",3200,3699),("Crown",3700,4199),
+    ("Ace",4200,999999)
+]
+PLACEMENT_RATING = {1:35,2:28,3:24,4:20,5:17,6:14,7:11,8:8,9:5,10:3}
+DEFAULT_SEASON_ID = "classic_s1"
+
+with db() as con:
+    con.execute("CREATE TABLE IF NOT EXISTS ranked_ratings (player_id TEXT NOT NULL, season_id TEXT NOT NULL, queue TEXT NOT NULL, rating INTEGER NOT NULL DEFAULT 1200, matches INTEGER NOT NULL DEFAULT 0, wins INTEGER NOT NULL DEFAULT 0, kills INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(player_id,season_id,queue))")
+    con.execute("CREATE TABLE IF NOT EXISTS ranked_match_results (match_id TEXT NOT NULL, player_id TEXT NOT NULL, season_id TEXT NOT NULL, queue TEXT NOT NULL, placement INTEGER NOT NULL, kills INTEGER NOT NULL, rating_change INTEGER NOT NULL, PRIMARY KEY(match_id,player_id))")
+
+def rank_details(rating: int, leaderboard_position: int | None = None):
+    if rating < 1700:
+        tier, floor = "Bronze",1200
+    elif rating < 2200:
+        tier, floor = "Silver",1700
+    elif rating < 2700:
+        tier, floor = "Gold",2200
+    elif rating < 3200:
+        tier, floor = "Platinum",2700
+    elif rating < 3700:
+        tier, floor = "Diamond",3200
+    elif rating < 4200:
+        tier, floor = "Crown",3700
+    else:
+        tier, floor = "Ace",4200
+    if rating < 1200:
+        tier, floor = "Unranked",0
+        division = None
+        progress = rating
+    elif tier == "Ace":
+        division = None
+        progress = rating-4200
+    else:
+        division_number = 5 - min(4,max(0,(rating-floor)//100))
+        division = f"{tier} {division_number}"
+        progress = rating % 100
+    conqueror = rating >= 4200 and leaderboard_position is not None and leaderboard_position <= 500
+    return {"tier":tier,"division":division,"rating":rating,"points_to_next_division":(100-progress if tier not in {"Ace","Unranked"} else None),"conqueror":conqueror,"leaderboard_position":leaderboard_position}
+
+class RankedResultInput(BaseModel):
+    player_id: str = Field(min_length=1,max_length=64)
+    season_id: str = Field(default=DEFAULT_SEASON_ID,min_length=1,max_length=40)
+    queue: Literal["solo_tpp","solo_fpp","duo_tpp","duo_fpp","squad_tpp","squad_fpp"]
+    placement: int = Field(ge=1,le=100)
+    kills: int = Field(default=0,ge=0,le=100)
+    survival_minutes: int = Field(default=0,ge=0,le=60)
+
+@app.get("/ranked/config")
+def ranked_config():
+    return {
+        "season_id":DEFAULT_SEASON_ID,
+        "queues":RANKED_QUEUES,
+        "tiers":[{"tier":name,"minimum_rating":low,"maximum_rating":high} for name,low,high in TIER_BANDS],
+        "division_size":100,
+        "conqueror_rule":"Top 500 players in each queue leaderboard among players at Ace rating or above.",
+        "note":"Classic-era inspired prototype thresholds and scoring; not verified PUBG Mobile 0.13.0 ranking formula."
+    }
+
+@app.get("/player/{player_id}/rank")
+def get_player_rank(player_id: str, season_id: str = Query(default=DEFAULT_SEASON_ID), queue: Literal["solo_tpp","solo_fpp","duo_tpp","duo_fpp","squad_tpp","squad_fpp"] = "squad_tpp"):
+    with db() as con:
+        row = con.execute("SELECT rating,matches,wins,kills FROM ranked_ratings WHERE player_id=? AND season_id=? AND queue=?",(player_id,season_id,queue)).fetchone()
+        if row is None:
+            return {"player_id":player_id,"season_id":season_id,"queue":queue,**rank_details(1200),"matches":0,"wins":0,"kills":0}
+        higher = con.execute("SELECT COUNT(*) FROM ranked_ratings WHERE season_id=? AND queue=? AND rating>? AND rating>=4200",(season_id,queue,row[0])).fetchone()[0]
+    position = higher+1 if row[0] >= 4200 else None
+    return {"player_id":player_id,"season_id":season_id,"queue":queue,**rank_details(row[0],position),"matches":row[1],"wins":row[2],"kills":row[3]}
+
+@app.post("/ranked/match/{match_id}/settle")
+def settle_ranked_match(match_id: str, data: RankedResultInput):
+    placement_points = PLACEMENT_RATING.get(data.placement, max(-10, 2-data.placement))
+    kill_points = min(data.kills,20)*3
+    survival_points = min(data.survival_minutes//5,6)
+    rating_change = placement_points + kill_points + survival_points - 8
+    with db() as con:
+        try:
+            con.execute("INSERT INTO ranked_match_results(match_id,player_id,season_id,queue,placement,kills,rating_change) VALUES(?,?,?,?,?,?,?)",(match_id,data.player_id,data.season_id,data.queue,data.placement,data.kills,rating_change))
+        except sqlite3.IntegrityError:
+            raise HTTPException(409,"Ranked result already settled for this player and match")
+        con.execute("INSERT OR IGNORE INTO ranked_ratings(player_id,season_id,queue,rating) VALUES(?,?,?,1200)",(data.player_id,data.season_id,data.queue))
+        con.execute("UPDATE ranked_ratings SET rating=MAX(0,rating+?),matches=matches+1,wins=wins+?,kills=kills+? WHERE player_id=? AND season_id=? AND queue=?",(rating_change,1 if data.placement==1 else 0,data.kills,data.player_id,data.season_id,data.queue))
+        row = con.execute("SELECT rating,matches,wins,kills FROM ranked_ratings WHERE player_id=? AND season_id=? AND queue=?",(data.player_id,data.season_id,data.queue)).fetchone()
+    return {"status":"rank_updated","player_id":data.player_id,"season_id":data.season_id,"queue":data.queue,"rating_change":rating_change,**rank_details(row[0]),"matches":row[1],"wins":row[2],"kills":row[3]}
+
+@app.get("/ranked/leaderboard/{queue}")
+def ranked_leaderboard(queue: Literal["solo_tpp","solo_fpp","duo_tpp","duo_fpp","squad_tpp","squad_fpp"], season_id: str = Query(default=DEFAULT_SEASON_ID), limit: int = Query(default=100,ge=1,le=500)):
+    with db() as con:
+        rows = con.execute("SELECT player_id,rating,matches,wins,kills FROM ranked_ratings WHERE season_id=? AND queue=? ORDER BY rating DESC,wins DESC,kills DESC LIMIT ?",(season_id,queue,limit)).fetchall()
+    entries = []
+    for index,row in enumerate(rows,1):
+        entries.append({"position":index,"player_id":row[0],**rank_details(row[1],index if row[1]>=4200 else None),"matches":row[2],"wins":row[3],"kills":row[4]})
+    return {"season_id":season_id,"queue":queue,"count":len(entries),"leaderboard":entries}
+
+@app.post("/ranked/season/{season_id}/reset")
+def reset_ranked_season(season_id: str, next_season_id: str = Query(min_length=1,max_length=40)):
+    if season_id == next_season_id:
+        raise HTTPException(400,"Next season must have a different ID")
+    with db() as con:
+        existing = con.execute("SELECT COUNT(*) FROM ranked_ratings WHERE season_id=?",(season_id,)).fetchone()[0]
+        if existing == 0:
+            raise HTTPException(404,"Season has no ranked data")
+        if con.execute("SELECT 1 FROM ranked_ratings WHERE season_id=? LIMIT 1",(next_season_id,)).fetchone():
+            raise HTTPException(409,"Next season already exists")
+        rows = con.execute("SELECT player_id,queue,rating FROM ranked_ratings WHERE season_id=?",(season_id,)).fetchall()
+        for player_id,queue,rating in rows:
+            # Prototype soft reset: preserve half the rating above the 1200 baseline.
+            reset_rating = 1200 + max(0,rating-1200)//2
+            con.execute("INSERT INTO ranked_ratings(player_id,season_id,queue,rating) VALUES(?,?,?,?)",(player_id,next_season_id,queue,reset_rating))
+    return {"status":"season_reset","previous_season":season_id,"new_season":next_season_id,"players_reset":len(rows)}
