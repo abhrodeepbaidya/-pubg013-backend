@@ -88,7 +88,7 @@ EXTENDED_MAG_BONUS = 10
 
 def weapon_magazine_capacity(weapon: dict) -> int:
     base = MAGAZINE_CAPACITY.get(weapon["weapon_id"], 30)
-    if "extended_mag" in weapon.get("attachments", []):
+    if any(a in weapon.get("attachments", []) for a in ("extended_mag", "extended_quickdraw_mag")):
         base += EXTENDED_MAG_BONUS
     return base
 
@@ -299,6 +299,8 @@ def equip_weapon(
     if data.weapon_id not in WEAPONS:
         raise HTTPException(400, "Unknown weapon")
     category, ammo_type, allowed_slot = WEAPONS[data.weapon_id]
+    if allowed_slot == "melee":
+        raise HTTPException(400, "Use the melee equip endpoint for melee weapons")
     if allowed_slot == "pistol" and slot != "pistol":
         raise HTTPException(400, "Pistol must use pistol slot")
     if allowed_slot == "primary" and slot == "pistol":
@@ -320,7 +322,7 @@ def equip_weapon(
         "reserve_ammo": data.reserve_ammo,
         "attachments": data.attachments,
         "magazine_capacity": MAGAZINE_CAPACITY.get(data.weapon_id, 30)
-            + (EXTENDED_MAG_BONUS if "extended_mag" in data.attachments else 0),
+            + (EXTENDED_MAG_BONUS if any(a in data.attachments for a in ("extended_mag", "extended_quickdraw_mag")) else 0),
     }
     save_player(player_id, state)
     return {"status": "equipped", "slot": slot, "weapon": state["weapons"][slot]}
