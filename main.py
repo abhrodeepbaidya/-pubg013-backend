@@ -10,7 +10,7 @@ from typing import Literal
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Battle Royale Backend", version="6.0.0")
+app = FastAPI(title="Battle Royale Backend", version="7.0.0")
 DB_PATH = Path(__file__).resolve().parent / "game.db"
 
 BASE_CAPACITY = 20
@@ -901,6 +901,7 @@ def systems_status():
             "vehicles_fuel": "prototype",
             "match_join_leave": "prototype_no_matchmaking",
             "BP_UC_crates_coupons": "prototype_wallet_crates_and_cosmetic_collection",
+            "erangel_spawn_timer_zone_results": "classic_timing_prototype_for_ue4_client",
         },
     }
 
@@ -1038,4 +1039,166 @@ def economy_history(player_id: str, limit: int = Query(default=50,ge=1,le=200)):
     with db() as con:
         rows = con.execute("SELECT currency,amount,reason,created_at FROM economy_transactions WHERE player_id=? ORDER BY id DESC LIMIT ?",(player_id,limit)).fetchall()
     return {"player_id":player_id,"transactions":[{"currency":r[0],"amount":r[1],"reason":r[2],"created_at":r[3]} for r in rows]}
+
+
+
+# v7 classic Erangel match clock, spawn-island countdown, blue-zone phases and result.
+import time
+import random
+import math
+
+ERANGEL_OLD_ZONE_PHASES = [
+    {"wait":150,"move":300,"dps":0.6,"radius_ratio":0.40},
+    {"wait":200,"move":140,"dps":0.8,"radius_ratio":0.55},
+    {"wait":150,"move":90,"dps":1.0,"radius_ratio":0.60},
+    {"wait":120,"move":60,"dps":3.0,"radius_ratio":0.60},
+    {"wait":120,"move":40,"dps":5.0,"radius_ratio":0.65},
+    {"wait":90,"move":30,"dps":8.0,"radius_ratio":0.65},
+    {"wait":90,"move":30,"dps":10.0,"radius_ratio":0.65},
+    {"wait":60,"move":30,"dps":14.0,"radius_ratio":0.70},
+    {"wait":15,"move":15,"dps":18.0,"radius_ratio":0.001},
+]
+SPAWN_ISLAND_SECONDS = 40
+ERANGEL_MAP_RADIUS_METERS = 4000
+
+with db() as con:
+    con.execute("CREATE TABLE IF NOT EXISTS match_sessions (match_id TEXT PRIMARY KEY, map_name TEXT NOT NULL, status TEXT NOT NULL, started_at REAL NOT NULL, state_json TEXT NOT NULL)")
+    con.execute("CREATE TABLE IF NOT EXISTS match_results (match_id TEXT PRIMARY KEY, winner_id TEXT NOT NULL, finished_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, result_json TEXT NOT NULL)")
+
+def get_match_session(match_id: str):
+    with db() as con:
+        row = con.execute("SELECT state_json FROM match_sessions WHERE match_id=?", (match_id,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "Match session not found")
+    return json.loads(row[0])
+
+def save_match_session(match_id: str, state: dict):
+    with db() as con:
+        con.execute("UPDATE match_sessions SET status=?, state_json=? WHERE match_id=?", (state["status"], json.dumps(state), match_id))
+
+def _circle_for_phase(previous: dict, ratio: float, phase_number: int):
+    old_radius = previous["radius_m"]
+    radius = max(3.0, old_radius * ratio)
+    max_offset = max(0.0, old_radius - radius)
+    # Keep the next circle fully within the previous circle.
+    angle = random.random() * math.tau
+    distance = random.random() * max_offset
+    return {
+        "x": previous["x"] + math.cos(angle) * distance,
+        "y": previous["y"] + math.sin(angle) * distance,
+        "radius_m": radius,
+        "phase": phase_number,
+    }
+
+def _zone_snapshot(state: dict, now: float):
+    if state["status"] == "spawn_island":
+        remaining = max(0, int(math.ceil(state["spawn_island_ends_at"] - now)))
+        return {"status":"spawn_island","countdown_seconds":remaining,"phase":0,"message":"Waiting for players to board the plane"}
+    if state["status"] in {"finished","cancelled"}:
+        return {"status":state["status"],"winner_id":state.get("winner_id"),"phase":state.get("phase",0)}
+    elapsed = max(0.0, now - state["match_started_at"])
+    cursor = 0.0
+    phase_data = None
+    for index, phase in enumerate(ERANGEL_OLD_ZONE_PHASES, start=1):
+        wait_end = cursor + phase["wait"]
+        move_end = wait_end + phase["move"]
+        if elapsed < wait_end:
+            phase_data = {"phase":index,"state":"waiting","seconds_remaining":math.ceil(wait_end-elapsed),"wait_seconds":phase["wait"],"move_seconds":phase["move"],"dps":phase["dps"],"circle":state["circles"][index-1]}
+            break
+        if elapsed < move_end:
+            phase_data = {"phase":index,"state":"shrinking","seconds_remaining":math.ceil(move_end-elapsed),"wait_seconds":phase["wait"],"move_seconds":phase["move"],"dps":phase["dps"],"circle":state["circles"][index-1]}
+            break
+        cursor = move_end
+    if phase_data is None:
+        phase_data = {"phase":len(ERANGEL_OLD_ZONE_PHASES),"state":"final","seconds_remaining":0,"wait_seconds":0,"move_seconds":0,"dps":ERANGEL_OLD_ZONE_PHASES[-1]["dps"],"circle":state["circles"][-1]}
+    phase_data.update({"status":"in_match","elapsed_seconds":int(elapsed),"blue_zone_dps":phase_data["dps"],"next_circle":state["circles"][min(phase_data["phase"],len(state["circles"])-1)]})
+    return phase_data
+
+@app.get("/maps/erangel/classic-config")
+def erangel_classic_config():
+    return {
+        "map":"Erangel","mode":"classic","spawn_island_countdown_seconds":SPAWN_ISLAND_SECONDS,
+        "zone_timing_source":"published old Erangel wait/move timing reference; not verified PUBG Mobile 0.13.0 server files",
+        "phases":[{"phase":i+1,**p} for i,p in enumerate(ERANGEL_OLD_ZONE_PHASES)],
+        "total_zone_seconds":sum(p["wait"]+p["move"] for p in ERANGEL_OLD_ZONE_PHASES)
+    }
+
+@app.post("/match/{match_id}/start-erangel")
+def start_erangel_match(match_id: str):
+    if not match_id or len(match_id) > 64:
+        raise HTTPException(400,"Invalid match_id")
+    with db() as con:
+        if con.execute("SELECT 1 FROM match_sessions WHERE match_id=?",(match_id,)).fetchone():
+            raise HTTPException(409,"Match session already exists")
+    now = time.time()
+    first_circle = {"x":random.uniform(-500,500),"y":random.uniform(-500,500),"radius_m":ERANGEL_MAP_RADIUS_METERS,"phase":1}
+    circles = [first_circle]
+    for index, phase in enumerate(ERANGEL_OLD_ZONE_PHASES[1:], start=2):
+        circles.append(_circle_for_phase(circles[-1],phase["radius_ratio"],index))
+    state = {
+        "match_id":match_id,"map":"Erangel","mode":"classic","status":"spawn_island",
+        "created_at":now,"spawn_island_ends_at":now+SPAWN_ISLAND_SECONDS,
+        "match_started_at":now+SPAWN_ISLAND_SECONDS,"circles":circles,"phase":0,
+        "winner_id":None
+    }
+    with db() as con:
+        con.execute("INSERT INTO match_sessions(match_id,map_name,status,started_at,state_json) VALUES(?,?,?,?,?)",(match_id,"Erangel","spawn_island",now,json.dumps(state)))
+    return {"status":"match_created","match_id":match_id,"map":"Erangel","spawn_island_countdown_seconds":SPAWN_ISLAND_SECONDS,"zone_schedule":"classic_old_erangel_reference","first_circle":circles[0]}
+
+@app.get("/match/{match_id}/battle-state")
+def erangel_battle_state(match_id: str):
+    state = get_match_session(match_id)
+    now = time.time()
+    if state["status"] == "spawn_island" and now >= state["spawn_island_ends_at"]:
+        state["status"] = "in_match"
+        save_match_session(match_id,state)
+    snapshot = _zone_snapshot(state,now)
+    snapshot["match_id"] = match_id
+    snapshot["map"] = state["map"]
+    snapshot["winner_id"] = state.get("winner_id")
+    return snapshot
+
+@app.post("/match/{match_id}/zone/damage")
+def apply_zone_damage(match_id: str, player_id: str, seconds_outside: int = Query(default=1,ge=1,le=60)):
+    state = get_match_session(match_id)
+    snapshot = _zone_snapshot(state,time.time())
+    if snapshot["status"] != "in_match":
+        raise HTTPException(409,"Blue-zone damage is only applied during an active match")
+    player = ensure_v4_state(get_player(player_id))
+    damage = int(math.ceil(snapshot["blue_zone_dps"] * seconds_outside))
+    player["health"] = max(0,player["health"]-damage)
+    save_player(player_id,player)
+    return {"player_id":player_id,"blue_zone_dps":snapshot["blue_zone_dps"],"seconds_outside":seconds_outside,"damage":damage,"health":player["health"],"eliminated":player["health"]<=0}
+
+@app.post("/match/{match_id}/finish")
+def finish_erangel_match(match_id: str, winner_id: str):
+    state = get_match_session(match_id)
+    if state["status"] == "finished":
+        raise HTTPException(409,"Match already finished")
+    with db() as con:
+        roster = con.execute("SELECT player_id,state_json FROM players").fetchall()
+    participants = []
+    for pid, raw in roster:
+        pstate = json.loads(raw)
+        m = pstate.get("match",{})
+        if m.get("status") == "in_match" and m.get("match_id") == match_id:
+            participants.append(pid)
+    if participants and winner_id not in participants:
+        raise HTTPException(400,"Winner must belong to this match roster")
+    state["status"] = "finished"
+    state["winner_id"] = winner_id
+    state["finished_at"] = time.time()
+    save_match_session(match_id,state)
+    result = {"match_id":match_id,"winner_id":winner_id,"banner":"WINNER WINNER CHICKEN DINNER","map":"Erangel"}
+    with db() as con:
+        con.execute("INSERT INTO match_results(match_id,winner_id,result_json) VALUES(?,?,?)",(match_id,winner_id,json.dumps(result)))
+    return {"status":"match_finished","result":result}
+
+@app.get("/match/{match_id}/result")
+def get_erangel_result(match_id: str):
+    with db() as con:
+        row = con.execute("SELECT result_json FROM match_results WHERE match_id=?",(match_id,)).fetchone()
+    if row is None:
+        raise HTTPException(404,"Match result not available")
+    return json.loads(row[0])
 
