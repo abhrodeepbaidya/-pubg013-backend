@@ -17,27 +17,19 @@ BASE_CAPACITY = 20
 BACKPACK_CAPACITY = {0: 0, 1: 150, 2: 200, 3: 250}
 VEST_CAPACITY = {0: 0, 1: 50, 2: 100, 3: 150}
 
-# weapon_id: (category, ammo_type, slot_type)
+# PUBG Mobile classic-era weapons: (category, ammo_type, slot_type)
 WEAPONS = {
-    "M416": ("AR", "5.56mm", "primary"),
-    "AKM": ("AR", "7.62mm", "primary"),
-    "SCAR-L": ("AR", "5.56mm", "primary"),
-    "M16A4": ("AR", "5.56mm", "primary"),
-    "UMP45": ("SMG", ".45 ACP", "primary"),
-    "UZI": ("SMG", "9mm", "primary"),
-    "Vector": ("SMG", ".45 ACP", "primary"),
-    "Kar98k": ("Sniper", "7.62mm", "primary"),
-    "M24": ("Sniper", "7.62mm", "primary"),
-    "AWM": ("Sniper", ".300 Magnum", "primary"),
-    "Mini14": ("DMR", "5.56mm", "primary"),
-    "SKS": ("DMR", "7.62mm", "primary"),
-    "DP-28": ("LMG", "7.62mm", "primary"),
-    "M249": ("LMG", "5.56mm", "primary"),
-    "S1897": ("Shotgun", "12 Gauge", "primary"),
-    "S686": ("Shotgun", "12 Gauge", "primary"),
-    "P92": ("Pistol", "9mm", "pistol"),
-    "P1911": ("Pistol", ".45 ACP", "pistol"),
-    "R1895": ("Pistol", "7.62mm", "pistol"),
+ "M416":("AR","5.56mm","primary"), "AKM":("AR","7.62mm","primary"), "SCAR-L":("AR","5.56mm","primary"), "M16A4":("AR","5.56mm","primary"),
+ "AUG A3":("AR","5.56mm","primary"), "Groza":("AR","7.62mm","primary"), "QBZ":("AR","5.56mm","primary"),
+ "UMP9":("SMG","9mm","primary"), "UMP45":("SMG",".45 ACP","primary"), "UZI":("SMG","9mm","primary"), "Vector":("SMG",".45 ACP","primary"), "Tommy Gun":("SMG",".45 ACP","primary"),
+ "Kar98k":("Sniper","7.62mm","primary"), "M24":("Sniper","7.62mm","primary"), "AWM":("Sniper",".300 Magnum","primary"), "Win94":("Sniper",".45 ACP","primary"),
+ "Mini14":("DMR","5.56mm","primary"), "SKS":("DMR","7.62mm","primary"), "Mk14":("DMR","7.62mm","primary"), "QBU":("DMR","5.56mm","primary"),
+ "DP-28":("LMG","7.62mm","primary"), "M249":("LMG","5.56mm","primary"),
+ "S1897":("Shotgun","12 Gauge","primary"), "S686":("Shotgun","12 Gauge","primary"), "S12K":("Shotgun","12 Gauge","primary"),
+ "P92":("Pistol","9mm","pistol"), "P18C":("Pistol","9mm","pistol"), "P1911":("Pistol",".45 ACP","pistol"),
+ "R1895":("Pistol","7.62mm","pistol"), "R45":("Pistol",".45 ACP","pistol"), "Sawed-off":("Pistol","12 Gauge","pistol"),
+ "Crossbow":("Special","Bolt","primary"),
+ "Pan":("Melee",None,"melee"), "Machete":("Melee",None,"melee"), "Crowbar":("Melee",None,"melee"), "Sickle":("Melee",None,"melee")
 }
 
 # attachment_id: (slot type, compatible weapons)
@@ -58,8 +50,8 @@ ATTACHMENTS = {
 }
 
 ITEM_WEIGHTS = {
-    "5.56mm": 1, "7.62mm": 1, "9mm": 1, ".45 ACP": 1,
-    ".300 Magnum": 1, "12 Gauge": 1, "bandage": 2,
+    "5.56mm":1,"7.62mm":1,"9mm":1,".45 ACP":1,".300 Magnum":1,"12 Gauge":1,"Bolt":1,"flare":1,
+    "pan":20,"machete":10,"crowbar":10,"sickle":10,"bandage":2,
     "first_aid_kit": 10, "med_kit": 20, "energy_drink": 4,
     "painkiller": 10, "frag_grenade": 12, "smoke_grenade": 10,
     "molotov": 10,
@@ -67,12 +59,11 @@ ITEM_WEIGHTS = {
 
 # Base magazine sizes for this prototype. Extended magazines add capacity.
 MAGAZINE_CAPACITY = {
-    "M416": 30, "AKM": 30, "SCAR-L": 30, "M16A4": 30,
-    "UMP45": 25, "UZI": 25, "Vector": 19,
-    "Kar98k": 5, "M24": 5, "AWM": 5,
-    "Mini14": 20, "SKS": 10, "DP-28": 47, "M249": 100,
-    "S1897": 5, "S686": 2,
-    "P92": 15, "P1911": 7, "R1895": 7,
+    "M416":30,"AKM":30,"SCAR-L":30,"M16A4":30,"AUG A3":30,"Groza":30,"QBZ":30,
+    "UMP9":30,"UMP45":25,"UZI":25,"Vector":19,"Tommy Gun":100,
+    "Kar98k":5,"M24":5,"AWM":5,"Win94":8,"Mini14":20,"SKS":10,"Mk14":10,"QBU":10,
+    "DP-28":47,"M249":100,"S1897":5,"S686":2,"S12K":5,
+    "P92":15,"P18C":17,"P1911":7,"R1895":7,"R45":6,"Sawed-off":2,"Crossbow":1,
 }
 EXTENDED_MAG_BONUS = 10
 
@@ -276,6 +267,8 @@ def weapon_catalog():
             {"attachment_id": n, "type": v[0], "compatible_weapons": sorted(v[1])}
             for n, v in ATTACHMENTS.items()
         ],
+        "ammo": ["5.56mm", "7.62mm", "9mm", ".45 ACP", ".300 Magnum", "12 Gauge", "Bolt", "flare"],
+        "melee": ["Pan", "Machete", "Crowbar", "Sickle"],
     }
 
 
@@ -313,6 +306,16 @@ def equip_weapon(
     }
     save_player(player_id, state)
     return {"status": "equipped", "slot": slot, "weapon": state["weapons"][slot]}
+
+
+@app.put("/player/{player_id}/melee")
+def equip_melee(player_id: str, weapon_id: str = Query(min_length=1)):
+    if weapon_id not in WEAPONS or WEAPONS[weapon_id][2] != "melee":
+        raise HTTPException(400, "Unknown melee weapon")
+    state = get_player(player_id)
+    state["melee"] = weapon_id
+    save_player(player_id, state)
+    return {"status": "melee_equipped", "melee": weapon_id}
 
 
 @app.delete("/player/{player_id}/weapon/{slot}")
