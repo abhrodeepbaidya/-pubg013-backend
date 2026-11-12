@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import secrets
+import uuid
 from pathlib import Path
 from typing import Literal
 
@@ -92,6 +94,11 @@ def init_db():
             "CREATE TABLE IF NOT EXISTS players "
             "(player_id TEXT PRIMARY KEY, state_json TEXT NOT NULL)"
         )
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS accounts ("
+            "player_id TEXT PRIMARY KEY, uid TEXT NOT NULL UNIQUE, "
+            "username TEXT NOT NULL, username_key TEXT NOT NULL UNIQUE)"
+        )
 
 
 def fresh_player():
@@ -168,6 +175,10 @@ class ItemInput(BaseModel):
     weight: int | None = Field(default=None, ge=0)
 
 
+class RegisterInput(BaseModel):
+    username: str = Field(min_length=3, max_length=16, pattern="^[A-Za-z0-9_]+$")
+
+
 @app.on_event("startup")
 def startup():
     init_db()
@@ -195,6 +206,46 @@ def create_player(player_id: str):
     save_player(player_id, state)
     return {"status": "created", "player_id": player_id, "player": state}
 
+
+@app.post("/auth/register")
+def register_account(data: RegisterInput):
+    username = data.username.strip()
+    username_key = username.casefold()
+    with db() as con:
+        if con.execute("SELECT 1 FROM accounts WHERE username_key=?", (username_key,)).fetchone():
+            raise HTTPException(409, "Username already in use")
+        player_id = str(uuid.uuid4())
+        for _ in range(20):
+            uid = str(secrets.randbelow(9_000_000_000) + 1_000_000_000)
+            try:
+                con.execute("INSERT INTO accounts(player_id,uid,username,username_key) VALUES(?,?,?,?)", (player_id, uid, username, username_key))
+                break
+            except sqlite3.IntegrityError:
+                if con.execute("SELECT 1 FROM accounts WHERE username_key=?", (username_key,)).fetchone():
+                    raise HTTPException(409, "Username already in use")
+        else:
+            raise HTTPException(503, "Could not allocate a unique player UID")
+    state = fresh_player()
+    save_player(player_id, state)
+    return {"status":"registered","username":username,"uid":uid,"player_id":player_id,"player":state}
+
+
+@app.get("/users/{uid}")
+def get_account_by_uid(uid: str):
+    with db() as con:
+        row = con.execute("SELECT uid,username,player_id FROM accounts WHERE uid=?", (uid,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "Account not found")
+    return {"uid":row[0],"username":row[1],"player_id":row[2]}
+
+
+@app.get("/users/by-username/{username}")
+def get_account_by_username(username: str):
+    with db() as con:
+        row = con.execute("SELECT uid,username,player_id FROM accounts WHERE username_key=?", (username.casefold(),)).fetchone()
+    if row is None:
+        raise HTTPException(404, "Account not found")
+    return {"uid":row[0],"username":row[1],"player_id":row[2]}
 
 @app.get("/players")
 def list_players():
