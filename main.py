@@ -1428,3 +1428,136 @@ def reset_ranked_season(season_id: str, next_season_id: str = Query(min_length=1
             reset_rating = 1200 + max(0,rating-1200)//2
             con.execute("INSERT INTO ranked_ratings(player_id,season_id,queue,rating) VALUES(?,?,?,?)",(player_id,next_season_id,queue,reset_rating))
     return {"status":"season_reset","previous_season":season_id,"new_season":next_season_id,"players_reset":len(rows)}
+
+
+# v10 building loot presets: randomized classic-era inspired indoor loot.
+BUILDING_LOOT_TABLES = {
+    "small_house": [
+        ("bandage", 5, 2, 24), ("9mm", 30, 1, 18), ("5.56mm", 30, 1, 16),
+        ("12 Gauge", 10, 1, 10), ("P92", 1, 1, 8), ("UZI", 1, 1, 5),
+        ("red_dot", 1, 1, 5), ("energy_drink", 1, 4, 5), ("frag_grenade", 1, 12, 3),
+        ("level_1_helmet", 1, 1, 3), ("level_1_vest", 1, 1, 3),
+    ],
+    "large_house": [
+        ("bandage", 5, 2, 18), ("5.56mm", 30, 1, 18), ("7.62mm", 30, 1, 15),
+        ("M416", 1, 1, 5), ("AKM", 1, 1, 5), ("UMP9", 1, 1, 5),
+        ("Kar98k", 1, 1, 2), ("red_dot", 1, 1, 5), ("scope_2x", 1, 1, 3),
+        ("first_aid_kit", 1, 10, 5), ("energy_drink", 1, 4, 5),
+        ("level_1_helmet", 1, 1, 5), ("level_1_vest", 1, 1, 5),
+        ("backpack_level_1", 1, 1, 4), ("frag_grenade", 1, 12, 3),
+    ],
+    "apartment": [
+        ("bandage", 5, 2, 16), ("5.56mm", 30, 1, 16), ("7.62mm", 30, 1, 16),
+        ("M416", 1, 1, 6), ("SCAR-L", 1, 1, 5), ("AKM", 1, 1, 5),
+        ("Mini14", 1, 1, 3), ("scope_3x", 1, 1, 3), ("scope_4x", 1, 1, 2),
+        ("first_aid_kit", 1, 10, 6), ("med_kit", 1, 20, 1),
+        ("level_2_helmet", 1, 1, 3), ("level_2_vest", 1, 1, 3),
+        ("backpack_level_2", 1, 1, 3), ("smoke_grenade", 1, 10, 4),
+    ],
+    "warehouse": [
+        ("5.56mm", 30, 1, 16), ("7.62mm", 30, 1, 16),
+        ("M249", 1, 1, 3), ("DP-28", 1, 1, 4), ("AKM", 1, 1, 5),
+        ("M416", 1, 1, 5), ("S12K", 1, 1, 4), ("Kar98k", 1, 1, 3),
+        ("scope_4x", 1, 1, 3), ("scope_6x", 1, 1, 1),
+        ("first_aid_kit", 1, 10, 5), ("level_2_vest", 1, 1, 4),
+        ("backpack_level_2", 1, 1, 4), ("frag_grenade", 1, 12, 4),
+    ],
+    "shed": [
+        ("9mm", 30, 1, 20), ("12 Gauge", 10, 1, 18), ("7.62mm", 15, 1, 12),
+        ("P1911", 1, 1, 8), ("R1895", 1, 1, 6), ("S1897", 1, 1, 5),
+        ("machete", 1, 10, 5), ("bandage", 5, 2, 8),
+        ("level_1_helmet", 1, 1, 3), ("smoke_grenade", 1, 10, 2),
+    ],
+    "garage": [
+        ("UMP9", 1, 1, 7), ("UZI", 1, 1, 6), ("S12K", 1, 1, 4),
+        ("9mm", 30, 1, 18), ("12 Gauge", 10, 1, 15),
+        ("bandage", 5, 2, 10), ("energy_drink", 1, 4, 5),
+        ("level_1_vest", 1, 1, 4), ("backpack_level_1", 1, 1, 4),
+    ],
+}
+BUILDING_LOOT_COUNTS = {
+    "small_house": (3, 6), "large_house": (5, 9), "apartment": (8, 14),
+    "warehouse": (7, 12), "shed": (1, 4), "garage": (2, 5),
+}
+BUILDING_LOOT_ITEMS = {
+    "bandage": ("bandage", 2), "first_aid_kit": ("first_aid_kit", 10),
+    "med_kit": ("med_kit", 20), "energy_drink": ("energy_drink", 4),
+    "painkiller": ("painkiller", 10), "frag_grenade": ("frag_grenade", 12),
+    "smoke_grenade": ("smoke_grenade", 10), "molotov": ("molotov", 10),
+    "5.56mm": ("5.56mm", 1), "7.62mm": ("7.62mm", 1), "9mm": ("9mm", 1),
+    ".45 ACP": (".45 ACP", 1), ".300 Magnum": (".300 Magnum", 1),
+    "12 Gauge": ("12 Gauge", 1), "Bolt": ("Bolt", 1),
+    "red_dot": ("red_dot", 1), "holographic": ("holographic", 1),
+    "scope_2x": ("scope_2x", 1), "scope_3x": ("scope_3x", 1),
+    "scope_4x": ("scope_4x", 1), "scope_6x": ("scope_6x", 1),
+    "scope_8x": ("scope_8x", 1), "compensator": ("compensator", 1),
+    "suppressor": ("suppressor", 1), "vertical_grip": ("vertical_grip", 1),
+    "angled_grip": ("angled_grip", 1), "extended_mag": ("extended_mag", 1),
+    "M416": ("M416", 1), "AKM": ("AKM", 1), "SCAR-L": ("SCAR-L", 1),
+    "UMP9": ("UMP9", 1), "UZI": ("UZI", 1), "Kar98k": ("Kar98k", 1),
+    "Mini14": ("Mini14", 1), "DP-28": ("DP-28", 1), "M249": ("M249", 1),
+    "S12K": ("S12K", 1), "S1897": ("S1897", 1), "P92": ("P92", 1),
+    "P1911": ("P1911", 1), "R1895": ("R1895", 1), "machete": ("machete", 10),
+    "level_1_helmet": ("helmet_level_1", 1), "level_2_helmet": ("helmet_level_2", 1),
+    "level_1_vest": ("vest_level_1", 1), "level_2_vest": ("vest_level_2", 1),
+    "backpack_level_1": ("backpack_level_1", 1), "backpack_level_2": ("backpack_level_2", 1),
+}
+
+class BuildingLootSpawnInput(BaseModel):
+    building_type: Literal["small_house","large_house","apartment","warehouse","shed","garage"]
+    x: float | None = None
+    y: float | None = None
+    z: float | None = None
+
+def _weighted_building_item(building_type: str):
+    entries = BUILDING_LOOT_TABLES[building_type]
+    chosen = random.choices(entries, weights=[entry[3] for entry in entries], k=1)[0]
+    item_id, quantity, weight, _ = chosen
+    return item_id, quantity, weight
+
+@app.get("/loot/buildings/config")
+def building_loot_config():
+    return {
+        "map": "Erangel",
+        "loot_model": "building_container_randomized",
+        "building_types": {
+            name: {"min_items": limits[0], "max_items": limits[1],
+                   "loot_table": [{"item_id": row[0], "quantity": row[1], "weight": row[2], "chance_weight": row[3]} for row in BUILDING_LOOT_TABLES[name]]}
+            for name, limits in BUILDING_LOOT_COUNTS.items()
+        },
+        "note": "Classic-era inspired prototype loot weights, not extracted official PUBG Mobile 0.13.0 spawn tables."
+    }
+
+@app.post("/match/{match_id}/building/{building_id}/loot/spawn")
+def spawn_building_loot(match_id: str, building_id: str, data: BuildingLootSpawnInput):
+    if not match_id or len(match_id) > 64 or not building_id or len(building_id) > 96:
+        raise HTTPException(400, "Invalid match_id or building_id")
+    # Each building is rolled once per server process; repeated calls return its existing crate.
+    key_prefix = f"{match_id}:{building_id}:"
+    existing = [loot_id for loot_id in LOOT_DROPS if loot_id.startswith(key_prefix)]
+    if existing:
+        return {"status": "already_spawned", "match_id": match_id, "building_id": building_id,
+                "building_type": data.building_type, "loot": [{"loot_id": lid, **LOOT_DROPS[lid]} for lid in existing]}
+    low, high = BUILDING_LOOT_COUNTS[data.building_type]
+    count = random.randint(low, high)
+    generated = []
+    for index in range(count):
+        raw_item, quantity, _ = _weighted_building_item(data.building_type)
+        item_id, weight = BUILDING_LOOT_ITEMS[raw_item]
+        loot_id = f"{key_prefix}{index}"
+        loot = {"item_id": item_id, "quantity": quantity, "weight": weight,
+                "match_id": match_id, "building_id": building_id,
+                "building_type": data.building_type, "position": {"x": data.x, "y": data.y, "z": data.z}}
+        LOOT_DROPS[loot_id] = loot
+        generated.append({"loot_id": loot_id, **loot})
+    return {"status": "building_loot_spawned", "match_id": match_id, "building_id": building_id,
+            "building_type": data.building_type, "loot_count": len(generated), "loot": generated}
+
+@app.get("/match/{match_id}/building/{building_id}/loot")
+def get_building_loot(match_id: str, building_id: str):
+    prefix = f"{match_id}:{building_id}:"
+    found = [{"loot_id": lid, **loot} for lid, loot in LOOT_DROPS.items()
+             if lid.startswith(prefix)]
+    if not found:
+        raise HTTPException(404, "Building loot not spawned or already looted")
+    return {"match_id": match_id, "building_id": building_id, "loot": found}
