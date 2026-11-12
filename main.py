@@ -874,10 +874,13 @@ def register_combat_hit(data: CombatHitInput):
     target["health"] = max(0,target["health"]-health_damage)
     eliminated = target["health"] == 0
     save_player(data.target_id,target)
+    death_crate = None
     if eliminated:
         with db() as con:
             con.execute("INSERT INTO kill_feed(match_id,killer_id,victim_id,weapon_id,hit_zone) VALUES(?,?,?,?,?)",(data.match_id,data.shooter_id,data.target_id,data.weapon_id,data.hit_zone))
-    return {"status":"hit_registered","damage":damage,"armor_absorbed":absorbed,"health_damage":health_damage,"target_health":target["health"],"eliminated":eliminated,"effects":{"hit_marker":True,"red_hit_effect":True,"blood_particle":True,"kill_notification":eliminated}}
+        death_crate = create_player_death_crate(data.match_id, data.target_id, target)
+    save_player(data.target_id,target)
+    return {"status":"hit_registered","damage":damage,"armor_absorbed":absorbed,"health_damage":health_damage,"target_health":target["health"],"eliminated":eliminated,"death_crate":death_crate,"effects":{"hit_marker":True,"red_hit_effect":True,"blood_particle":True,"kill_notification":eliminated}}
 
 @app.get("/match/{match_id}/kill-feed")
 def get_kill_feed(match_id: str,limit: int = Query(default=20,ge=1,le=100)):
@@ -1657,3 +1660,64 @@ def open_supply_crate(match_id: str, airdrop_id: str):
     crate["opened"] = True
     crate["status"] = "looted"
     return {"status": "crate_opened", "airdrop_id": airdrop_id, "contents": crate["contents"]}
+
+
+# v12 player death crates preserve the actual remaining condition of carried gear.
+DEATH_CRATES = {}
+
+def create_player_death_crate(match_id: str, player_id: str, state: dict):
+    crate_id = f"{match_id}:death:{player_id}"
+    if crate_id in DEATH_CRATES:
+        return {"crate_id": crate_id, "status": "already_created"}
+    contents = []
+    for slot, weapon in state.get("weapons", {}).items():
+        if weapon:
+            contents.append({"type": "weapon", "slot": slot, **json.loads(json.dumps(weapon))})
+    if state.get("melee"):
+        contents.append({"type": "melee", "weapon_id": state["melee"]})
+    for item in state.get("items", []):
+        if item.get("quantity", 0) > 0:
+            contents.append({"type": "item", **json.loads(json.dumps(item))})
+    for item_id, quantity in state.get("throwables", {}).items():
+        if quantity > 0:
+            contents.append({"type": "throwable", "item_id": item_id, "quantity": quantity})
+    armor = state.get("armor", {})
+    helmet_level = armor.get("helmet_level", 0)
+    helmet_durability = armor.get("helmet_durability", 0)
+    vest_level = state.get("vest_level", 0)
+    vest_durability = armor.get("vest_durability", 0)
+    if helmet_level > 0 and helmet_durability > 0:
+        contents.append({"type": "helmet", "level": helmet_level,
+                         "durability": helmet_durability, "max_durability": HELMET_DURABILITY[helmet_level]})
+    if vest_level > 0 and vest_durability > 0:
+        contents.append({"type": "vest", "level": vest_level,
+                         "durability": vest_durability, "max_durability": VEST_DURABILITY[vest_level]})
+    if state.get("backpack_level", 0) > 0:
+        contents.append({"type": "backpack", "level": state["backpack_level"]})
+    crate = {"crate_id": crate_id, "match_id": match_id, "owner_id": player_id,
+             "status": "available", "contents": contents, "created_at": time.time()}
+    DEATH_CRATES[crate_id] = crate
+    # Remove carried loot from the eliminated player's live inventory.
+    state["weapons"] = {"primary_1": None, "primary_2": None, "pistol": None}
+    state["melee"] = None
+    state["items"] = []
+    state["throwables"] = {"frag_grenade": 0, "smoke_grenade": 0, "molotov": 0}
+    state["active_throwable"] = None
+    state["backpack_level"] = 0
+    state["vest_level"] = 0
+    state["armor"] = {"helmet_level": 0, "helmet_durability": 0, "vest_durability": 0}
+    return {"crate_id": crate_id, "status": "created", "loot_count": len(contents)}
+
+@app.get("/match/{match_id}/death-crates")
+def list_death_crates(match_id: str):
+    crates = [c for c in DEATH_CRATES.values() if c["match_id"] == match_id and c["status"] == "available"]
+    return {"match_id": match_id, "count": len(crates),
+            "death_crates": [{"crate_id": c["crate_id"], "owner_id": c["owner_id"],
+                              "loot_count": len(c["contents"]), "position": c.get("position")} for c in crates]}
+
+@app.get("/match/{match_id}/death-crate/{crate_id}")
+def get_death_crate(match_id: str, crate_id: str):
+    crate = DEATH_CRATES.get(crate_id)
+    if crate is None or crate["match_id"] != match_id:
+        raise HTTPException(404, "Death crate not found")
+    return crate
