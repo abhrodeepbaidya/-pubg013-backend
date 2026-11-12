@@ -49,6 +49,24 @@ ATTACHMENTS = {
     "quickdraw_mag": ("magazine", {"M416", "AKM", "SCAR-L", "M16A4", "UMP45", "UZI", "Vector", "P92", "P1911"}),
 }
 
+# Expand attachment compatibility for the full catalogue while keeping attachment slots distinct.
+_ALL_FIREARMS = {name for name, spec in WEAPONS.items() if spec[0] not in {"Melee", "Special"}}
+_RIFLES_AND_DMR = {name for name, spec in WEAPONS.items() if spec[0] in {"AR", "DMR", "LMG", "Sniper"}}
+_DETACHABLE_MAG_GUNS = {name for name, spec in WEAPONS.items() if spec[0] in {"AR", "SMG", "DMR", "Pistol"}}
+for _attachment_id, (_slot_type, _compatible) in list(ATTACHMENTS.items()):
+    if _slot_type == "optic":
+        ATTACHMENTS[_attachment_id] = (_slot_type, _ALL_FIREARMS - {"Sawed-off"})
+    elif _slot_type == "muzzle" and _attachment_id == "compensator":
+        ATTACHMENTS[_attachment_id] = (_slot_type, _RIFLES_AND_DMR)
+    elif _slot_type == "muzzle" and _attachment_id == "suppressor":
+        ATTACHMENTS[_attachment_id] = (_slot_type, _ALL_FIREARMS)
+    elif _slot_type == "grip":
+        ATTACHMENTS[_attachment_id] = (_slot_type, {n for n in _ALL_FIREARMS if WEAPONS[n][0] in {"AR", "SMG"}})
+    elif _slot_type == "magazine":
+        ATTACHMENTS[_attachment_id] = (_slot_type, _DETACHABLE_MAG_GUNS)
+ATTACHMENTS["extended_quickdraw_mag"] = ("magazine", _DETACHABLE_MAG_GUNS)
+
+
 ITEM_WEIGHTS = {
     "5.56mm":1,"7.62mm":1,"9mm":1,".45 ACP":1,".300 Magnum":1,"12 Gauge":1,"Bolt":1,"flare":1,
     "pan":20,"machete":10,"crowbar":10,"sickle":10,"bandage":2,
