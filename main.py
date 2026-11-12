@@ -10,7 +10,7 @@ from typing import Literal
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Battle Royale Backend", version="5.0.0")
+app = FastAPI(title="Battle Royale Backend", version="6.0.0")
 DB_PATH = Path(__file__).resolve().parent / "game.db"
 
 BASE_CAPACITY = 20
@@ -109,6 +109,10 @@ def init_db():
             "username TEXT NOT NULL, username_key TEXT NOT NULL UNIQUE)"
         )
         con.execute("CREATE TABLE IF NOT EXISTS kill_feed (id INTEGER PRIMARY KEY AUTOINCREMENT, match_id TEXT NOT NULL, killer_id TEXT NOT NULL, victim_id TEXT NOT NULL, weapon_id TEXT NOT NULL, hit_zone TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+        con.execute("CREATE TABLE IF NOT EXISTS wallets (player_id TEXT PRIMARY KEY, bp INTEGER NOT NULL DEFAULT 0, uc INTEGER NOT NULL DEFAULT 0, classic_fragments INTEGER NOT NULL DEFAULT 0, premium_fragments INTEGER NOT NULL DEFAULT 0, supply_fragments INTEGER NOT NULL DEFAULT 0)")
+        con.execute("CREATE TABLE IF NOT EXISTS owned_cosmetics (id INTEGER PRIMARY KEY AUTOINCREMENT, player_id TEXT NOT NULL, item_id TEXT NOT NULL, crate_id TEXT NOT NULL, rarity TEXT NOT NULL, obtained_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+        con.execute("CREATE TABLE IF NOT EXISTS economy_transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, player_id TEXT NOT NULL, currency TEXT NOT NULL, amount INTEGER NOT NULL, reason TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+        con.execute("CREATE TABLE IF NOT EXISTS match_rewards (match_id TEXT NOT NULL, player_id TEXT NOT NULL, bp_awarded INTEGER NOT NULL, PRIMARY KEY(match_id, player_id))")
 
 
 def fresh_player():
@@ -896,5 +900,142 @@ def systems_status():
             "loot_drops": "prototype_in_memory",
             "vehicles_fuel": "prototype",
             "match_join_leave": "prototype_no_matchmaking",
+            "BP_UC_crates_coupons": "prototype_wallet_crates_and_cosmetic_collection",
         },
     }
+
+
+# v6 economy: BP/UC wallets, crate coupons, fragments and cosmetic inventory.
+CRATE_CONFIG = {
+    "classic": {
+        "currency": "uc", "price": 60, "fragment_key": "classic_fragments",
+        "coupon_fragments": 10,
+        "rewards": [
+            {"item_id":"classic_outfit_common","rarity":"common","weight":55},
+            {"item_id":"classic_headgear","rarity":"rare","weight":25},
+            {"item_id":"classic_weapon_finish","rarity":"epic","weight":15},
+            {"item_id":"classic_legendary_set","rarity":"legendary","weight":5},
+        ],
+    },
+    "premium": {
+        "currency": "uc", "price": 60, "fragment_key": "premium_fragments",
+        "coupon_fragments": 10,
+        "rewards": [
+            {"item_id":"premium_outfit_common","rarity":"common","weight":45},
+            {"item_id":"premium_headgear","rarity":"rare","weight":30},
+            {"item_id":"premium_weapon_finish","rarity":"epic","weight":20},
+            {"item_id":"premium_legendary_set","rarity":"legendary","weight":5},
+        ],
+    },
+    "supply": {
+        "currency": "bp", "price": 700, "fragment_key": "supply_fragments",
+        "coupon_fragments": 10,
+        "rewards": [
+            {"item_id":"supply_outfit","rarity":"common","weight":65},
+            {"item_id":"supply_headgear","rarity":"rare","weight":25},
+            {"item_id":"supply_weapon_finish","rarity":"epic","weight":10},
+        ],
+    },
+}
+
+def ensure_wallet(player_id: str):
+    with db() as con:
+        con.execute("INSERT OR IGNORE INTO wallets(player_id) VALUES(?)", (player_id,))
+        row = con.execute("SELECT bp,uc,classic_fragments,premium_fragments,supply_fragments FROM wallets WHERE player_id=?", (player_id,)).fetchone()
+    return {"bp":row[0],"uc":row[1],"classic_fragments":row[2],"premium_fragments":row[3],"supply_fragments":row[4]}
+
+def weighted_crate_reward(crate_id: str):
+    rewards = CRATE_CONFIG[crate_id]["rewards"]
+    total = sum(x["weight"] for x in rewards)
+    roll = secrets.randbelow(total)
+    for reward in rewards:
+        if roll < reward["weight"]:
+            return reward
+        roll -= reward["weight"]
+    return rewards[-1]
+
+@app.get("/economy/config")
+def economy_config():
+    return {
+        "currencies": {"BP":"earned gameplay currency","UC":"premium currency; credited only by trusted purchase validation"},
+        "crates": {
+            key: {"price":value["price"],"currency":value["currency"],"coupon_fragments":value["coupon_fragments"],
+                  "drop_rates_percent":{x["rarity"]:x["weight"] for x in value["rewards"]}}
+            for key,value in CRATE_CONFIG.items()
+        },
+        "coupon_rules": {"fragments_per_coupon":10,"coupon_types":["classic","premium","supply"]},
+        "note":"Prototype economy tuning, not official PUBG pricing or drop rates."
+    }
+
+@app.get("/player/{player_id}/wallet")
+def get_wallet(player_id: str):
+    return {"player_id":player_id, **ensure_wallet(player_id)}
+
+@app.post("/player/{player_id}/match/{match_id}/claim-bp")
+def claim_match_bp(player_id: str, match_id: str, placement: int = Query(ge=1,le=100), kills: int = Query(default=0,ge=0,le=100)):
+    # Prototype only: production must call this from a trusted match-server settlement service.
+    bp = max(0, 100 + max(0, 101-placement)*8 + kills*20)
+    with db() as con:
+        try:
+            con.execute("INSERT INTO match_rewards(match_id,player_id,bp_awarded) VALUES(?,?,?)",(match_id,player_id,bp))
+        except sqlite3.IntegrityError:
+            raise HTTPException(409,"Match reward already claimed")
+        con.execute("INSERT OR IGNORE INTO wallets(player_id) VALUES(?)",(player_id,))
+        con.execute("UPDATE wallets SET bp=bp+? WHERE player_id=?",(bp,player_id))
+        con.execute("INSERT INTO economy_transactions(player_id,currency,amount,reason) VALUES(?,?,?,?)",(player_id,"BP",bp,"match_reward"))
+    return {"status":"rewarded","bp_awarded":bp,"wallet":ensure_wallet(player_id)}
+
+@app.post("/player/{player_id}/coupon/{coupon_type}/craft")
+def craft_coupon(player_id: str, coupon_type: Literal["classic","premium","supply"], quantity: int = Query(default=1,ge=1,le=100)):
+    key = coupon_type + "_fragments"
+    needed = CRATE_CONFIG[coupon_type]["coupon_fragments"] * quantity
+    with db() as con:
+        con.execute("INSERT OR IGNORE INTO wallets(player_id) VALUES(?)",(player_id,))
+        row = con.execute(f"SELECT {key} FROM wallets WHERE player_id=?",(player_id,)).fetchone()
+        if row[0] < needed:
+            raise HTTPException(400,"Not enough coupon fragments")
+        con.execute(f"UPDATE wallets SET {key}={key}-? WHERE player_id=?",(needed,player_id))
+    return {"status":"coupon_crafted","coupon_type":coupon_type,"coupons_added":quantity,"fragments_used":needed,"wallet":ensure_wallet(player_id)}
+
+@app.post("/player/{player_id}/crate/{crate_id}/open")
+def open_crate(player_id: str, crate_id: Literal["classic","premium","supply"], quantity: int = Query(default=1,ge=1,le=10), payment: Literal["currency","coupon"] = "currency"):
+    config = CRATE_CONFIG[crate_id]
+    with db() as con:
+        con.execute("INSERT OR IGNORE INTO wallets(player_id) VALUES(?)",(player_id,))
+        wallet = con.execute("SELECT bp,uc,classic_fragments,premium_fragments,supply_fragments FROM wallets WHERE player_id=?",(player_id,)).fetchone()
+        if payment == "currency":
+            col = config["currency"]
+            cost = config["price"] * quantity
+            balance = wallet[0] if col == "bp" else wallet[1]
+            if balance < cost:
+                raise HTTPException(400,f"Not enough {col.upper()}")
+            con.execute(f"UPDATE wallets SET {col}={col}-? WHERE player_id=?",(cost,player_id))
+            con.execute("INSERT INTO economy_transactions(player_id,currency,amount,reason) VALUES(?,?,?,?)",(player_id,col.upper(),-cost,crate_id+"_crate"))
+        else:
+            col = config["fragment_key"]
+            # One complete coupon is represented by 10 fragments; consume that amount per opening.
+            cost = config["coupon_fragments"] * quantity
+            index = {"classic_fragments":2,"premium_fragments":3,"supply_fragments":4}[col]
+            if wallet[index] < cost:
+                raise HTTPException(400,"Not enough complete-coupon equivalent fragments")
+            con.execute(f"UPDATE wallets SET {col}={col}-? WHERE player_id=?",(cost,player_id))
+    won = []
+    with db() as con:
+        for _ in range(quantity):
+            reward = weighted_crate_reward(crate_id)
+            con.execute("INSERT INTO owned_cosmetics(player_id,item_id,crate_id,rarity) VALUES(?,?,?,?)",(player_id,reward["item_id"],crate_id,reward["rarity"]))
+            won.append(reward)
+    return {"status":"crate_opened","crate_id":crate_id,"payment":payment,"rewards":won,"wallet":ensure_wallet(player_id)}
+
+@app.get("/player/{player_id}/collection")
+def get_collection(player_id: str):
+    with db() as con:
+        rows = con.execute("SELECT item_id,crate_id,rarity,obtained_at FROM owned_cosmetics WHERE player_id=? ORDER BY id DESC",(player_id,)).fetchall()
+    return {"player_id":player_id,"items":[{"item_id":r[0],"crate_id":r[1],"rarity":r[2],"obtained_at":r[3]} for r in rows]}
+
+@app.get("/player/{player_id}/economy/history")
+def economy_history(player_id: str, limit: int = Query(default=50,ge=1,le=200)):
+    with db() as con:
+        rows = con.execute("SELECT currency,amount,reason,created_at FROM economy_transactions WHERE player_id=? ORDER BY id DESC LIMIT ?",(player_id,limit)).fetchall()
+    return {"player_id":player_id,"transactions":[{"currency":r[0],"amount":r[1],"reason":r[2],"created_at":r[3]} for r in rows]}
+
