@@ -8,7 +8,7 @@ from typing import Literal
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Battle Royale Backend", version="3.2.0")
+app = FastAPI(title="Battle Royale Backend", version="4.0.0")
 DB_PATH = Path(__file__).resolve().parent / "game.db"
 
 BASE_CAPACITY = 20
@@ -104,6 +104,10 @@ def fresh_player():
         "vest_level": 0,
         "health": 100,
         "boost": 0,
+        "armor": {"helmet_level": 0, "helmet_durability": 0, "vest_durability": 0},
+        "throwables": {"frag_grenade": 0, "smoke_grenade": 0, "molotov": 0},
+        "vehicle": None,
+        "match": {"status": "idle", "match_id": None},
     }
 
 
@@ -442,3 +446,263 @@ def fire_weapon(
 
 # Initialize database when module is imported by Uvicorn.
 init_db()
+
+# --- Version 4 gameplay systems: healing, boost, armor, loot, vehicles and match flow ---
+
+class HealInput(BaseModel):
+    item_id: Literal["bandage", "first_aid_kit", "med_kit"]
+    quantity: int = Field(default=1, ge=1, le=10)
+
+
+class DamageInput(BaseModel):
+    damage: int = Field(ge=1, le=200)
+    hit_zone: Literal["head", "body", "limbs"] = "body"
+
+
+class ArmorInput(BaseModel):
+    helmet_level: int = Field(default=0, ge=0, le=3)
+    vest_level: int = Field(default=0, ge=0, le=3)
+
+
+class BoostInput(BaseModel):
+    item_id: Literal["energy_drink", "painkiller", "adrenaline_syringe"]
+    quantity: int = Field(default=1, ge=1, le=10)
+
+
+class ThrowableInput(BaseModel):
+    item_id: Literal["frag_grenade", "smoke_grenade", "molotov"]
+    quantity: int = Field(default=1, ge=1, le=10)
+
+
+class VehicleInput(BaseModel):
+    vehicle_id: str = Field(min_length=1, max_length=40)
+    fuel: int = Field(default=100, ge=0, le=100)
+
+
+class LootInput(BaseModel):
+    loot_id: str = Field(min_length=1, max_length=64)
+    item_id: str = Field(min_length=1, max_length=64)
+    quantity: int = Field(ge=1, le=1000)
+    weight: int = Field(default=1, ge=0, le=1000)
+
+
+# PUBG-like prototype tuning values; these are game-design parameters, not official server data.
+HEAL_VALUES = {"bandage": 15, "first_aid_kit": 75, "med_kit": 100}
+BOOST_VALUES = {"energy_drink": 40, "painkiller": 60, "adrenaline_syringe": 100}
+VEST_REDUCTION = {0: 0.0, 1: 0.30, 2: 0.40, 3: 0.55}
+HELMET_REDUCTION = {0: 0.0, 1: 0.30, 2: 0.40, 3: 0.55}
+HELMET_DURABILITY = {0: 0, 1: 80, 2: 150, 3: 230}
+VEST_DURABILITY = {0: 0, 1: 200, 2: 220, 3: 250}
+LOOT_DROPS = {}
+
+
+def ensure_v4_state(state: dict):
+    state.setdefault("armor", {"helmet_level": 0, "helmet_durability": 0, "vest_durability": 0})
+    state.setdefault("throwables", {"frag_grenade": 0, "smoke_grenade": 0, "molotov": 0})
+    state.setdefault("vehicle", None)
+    state.setdefault("match", {"status": "idle", "match_id": None})
+    state.setdefault("boost", 0)
+    return state
+
+
+def consume_item(state: dict, item_id: str, quantity: int = 1):
+    item = next((x for x in state["items"] if x["item_id"] == item_id), None)
+    if item is None or item["quantity"] < quantity:
+        raise HTTPException(400, f"Not enough {item_id}")
+    item["quantity"] -= quantity
+    if item["quantity"] == 0:
+        state["items"].remove(item)
+
+
+@app.post("/player/{player_id}/heal")
+def heal_player(player_id: str, data: HealInput):
+    state = ensure_v4_state(get_player(player_id))
+    if data.item_id == "bandage" and state["health"] >= 75:
+        raise HTTPException(400, "Bandages cannot heal above 75 health")
+    if data.item_id == "first_aid_kit" and state["health"] >= 75:
+        raise HTTPException(400, "Health is already at or above 75")
+    if state["health"] >= 100:
+        raise HTTPException(400, "Health is already full")
+    consume_item(state, data.item_id, data.quantity)
+    amount = HEAL_VALUES[data.item_id] * data.quantity
+    if data.item_id == "first_aid_kit":
+        state["health"] = min(75, state["health"] + amount)
+    else:
+        state["health"] = min(100, state["health"] + amount)
+    save_player(player_id, state)
+    return {"status": "healed", "item_id": data.item_id, "health": state["health"]}
+
+
+@app.post("/player/{player_id}/boost")
+def use_boost(player_id: str, data: BoostInput):
+    state = ensure_v4_state(get_player(player_id))
+    consume_item(state, data.item_id, data.quantity)
+    state["boost"] = min(100, state["boost"] + BOOST_VALUES[data.item_id] * data.quantity)
+    save_player(player_id, state)
+    return {"status": "boost_used", "boost": state["boost"]}
+
+
+@app.put("/player/{player_id}/armor")
+def equip_armor(player_id: str, data: ArmorInput):
+    state = ensure_v4_state(get_player(player_id))
+    state["armor"] = {
+        "helmet_level": data.helmet_level,
+        "helmet_durability": HELMET_DURABILITY[data.helmet_level],
+        "vest_durability": VEST_DURABILITY[state["vest_level"]],
+    }
+    state["vest_level"] = data.vest_level
+    state["armor"]["vest_durability"] = VEST_DURABILITY[data.vest_level]
+    save_player(player_id, state)
+    return {"status": "armor_equipped", "armor": state["armor"]}
+
+
+@app.post("/player/{player_id}/damage")
+def apply_damage(player_id: str, data: DamageInput):
+    state = ensure_v4_state(get_player(player_id))
+    armor = state["armor"]
+    level_key = "helmet_level" if data.hit_zone == "head" else None
+    durability_key = "helmet_durability" if data.hit_zone == "head" else "vest_durability"
+    armor_level = armor[level_key] if level_key else state["vest_level"]
+    durability = armor[durability_key]
+    reduction = HELMET_REDUCTION[armor_level] if data.hit_zone == "head" else VEST_REDUCTION[state["vest_level"]]
+    absorbed = min(durability, int(data.damage * reduction))
+    armor[durability_key] = max(0, durability - absorbed)
+    actual_damage = data.damage - absorbed
+    state["health"] = max(0, state["health"] - actual_damage)
+    save_player(player_id, state)
+    return {
+        "status": "damage_applied", "damage_received": data.damage,
+        "armor_absorbed": absorbed, "health_damage": actual_damage,
+        "health": state["health"], "armor": armor,
+        "knocked_out": state["health"] == 0,
+    }
+
+
+@app.post("/player/{player_id}/throwable")
+def add_throwable(player_id: str, data: ThrowableInput):
+    state = ensure_v4_state(get_player(player_id))
+    consume_item(state, data.item_id, data.quantity)
+    state["throwables"][data.item_id] += data.quantity
+    save_player(player_id, state)
+    return {"status": "throwable_ready", "throwables": state["throwables"]}
+
+
+@app.post("/player/{player_id}/throwable/{item_id}/use")
+def use_throwable(player_id: str, item_id: Literal["frag_grenade", "smoke_grenade", "molotov"]):
+    state = ensure_v4_state(get_player(player_id))
+    if state["throwables"][item_id] < 1:
+        raise HTTPException(400, "Throwable not available in active slot")
+    state["throwables"][item_id] -= 1
+    save_player(player_id, state)
+    return {"status": "thrown", "item_id": item_id, "remaining": state["throwables"][item_id]}
+
+
+@app.post("/loot")
+def create_loot(data: LootInput):
+    if data.loot_id in LOOT_DROPS:
+        raise HTTPException(409, "Loot drop already exists")
+    LOOT_DROPS[data.loot_id] = {
+        "item_id": data.item_id, "quantity": data.quantity, "weight": data.weight
+    }
+    return {"status": "loot_spawned", "loot_id": data.loot_id, **LOOT_DROPS[data.loot_id]}
+
+
+@app.post("/player/{player_id}/loot/{loot_id}/pickup")
+def pickup_loot(player_id: str, loot_id: str):
+    state = ensure_v4_state(get_player(player_id))
+    loot = LOOT_DROPS.get(loot_id)
+    if loot is None:
+        raise HTTPException(404, "Loot not found")
+    if used_capacity(state) + loot["quantity"] * loot["weight"] > max_capacity(state):
+        raise HTTPException(400, "Inventory capacity exceeded")
+    item = next((x for x in state["items"] if x["item_id"] == loot["item_id"] and x["weight"] == loot["weight"]), None)
+    if item:
+        item["quantity"] += loot["quantity"]
+    else:
+        state["items"].append({"item_id": loot["item_id"], "quantity": loot["quantity"], "weight": loot["weight"]})
+    del LOOT_DROPS[loot_id]
+    save_player(player_id, state)
+    return {"status": "loot_picked_up", "item_id": loot["item_id"], "quantity": loot["quantity"]}
+
+
+@app.put("/player/{player_id}/vehicle")
+def enter_vehicle(player_id: str, data: VehicleInput):
+    state = ensure_v4_state(get_player(player_id))
+    if state["vehicle"] is not None:
+        raise HTTPException(409, "Player is already in a vehicle")
+    state["vehicle"] = {"vehicle_id": data.vehicle_id, "fuel": data.fuel}
+    save_player(player_id, state)
+    return {"status": "entered_vehicle", "vehicle": state["vehicle"]}
+
+
+@app.post("/player/{player_id}/vehicle/fuel")
+def consume_vehicle_fuel(player_id: str, amount: int = Query(default=1, ge=1, le=100)):
+    state = ensure_v4_state(get_player(player_id))
+    if state["vehicle"] is None:
+        raise HTTPException(400, "Player is not in a vehicle")
+    state["vehicle"]["fuel"] = max(0, state["vehicle"]["fuel"] - amount)
+    if state["vehicle"]["fuel"] == 0:
+        state["vehicle"]["engine"] = "out_of_fuel"
+    save_player(player_id, state)
+    return {"status": "fuel_updated", "vehicle": state["vehicle"]}
+
+
+@app.delete("/player/{player_id}/vehicle")
+def exit_vehicle(player_id: str):
+    state = ensure_v4_state(get_player(player_id))
+    if state["vehicle"] is None:
+        raise HTTPException(400, "Player is not in a vehicle")
+    vehicle = state["vehicle"]
+    state["vehicle"] = None
+    save_player(player_id, state)
+    return {"status": "exited_vehicle", "vehicle": vehicle}
+
+
+@app.post("/player/{player_id}/match/join")
+def join_match(player_id: str, match_id: str = Query(min_length=1, max_length=64)):
+    state = ensure_v4_state(get_player(player_id))
+    if state["match"]["status"] == "in_match":
+        raise HTTPException(409, "Player is already in a match")
+    state["match"] = {"status": "in_match", "match_id": match_id}
+    save_player(player_id, state)
+    return {"status": "match_joined", "match": state["match"]}
+
+
+@app.post("/player/{player_id}/match/leave")
+def leave_match(player_id: str):
+    state = ensure_v4_state(get_player(player_id))
+    if state["match"]["status"] != "in_match":
+        raise HTTPException(400, "Player is not in a match")
+    state["match"] = {"status": "idle", "match_id": None}
+    save_player(player_id, state)
+    return {"status": "match_left", "match": state["match"]}
+
+
+@app.get("/match/{match_id}/players")
+def match_players(match_id: str):
+    with db() as con:
+        rows = con.execute("SELECT player_id, state_json FROM players").fetchall()
+    players = []
+    for player_id, raw in rows:
+        player_state = json.loads(raw)
+        match = player_state.get("match", {"status": "idle", "match_id": None})
+        if match.get("status") == "in_match" and match.get("match_id") == match_id:
+            players.append(player_id)
+    return {"match_id": match_id, "players": players, "count": len(players)}
+
+
+@app.get("/systems")
+def systems_status():
+    return {
+        "version": app.version,
+        "systems": {
+            "players_inventory": "available",
+            "weapons_attachments_ammo": "available",
+            "healing_boost": "available",
+            "armor_damage": "prototype",
+            "throwables": "prototype",
+            "loot_drops": "prototype_in_memory",
+            "vehicles_fuel": "prototype",
+            "match_join_leave": "prototype_no_matchmaking",
+        },
+    }
