@@ -1561,3 +1561,99 @@ def get_building_loot(match_id: str, building_id: str):
     if not found:
         raise HTTPException(404, "Building loot not spawned or already looted")
     return {"match_id": match_id, "building_id": building_id, "loot": found}
+
+
+# v11 supply aircraft and exclusive airdrop crate loot.
+# AWM, Groza and Mk14 are intentionally excluded from all normal building loot.
+AIRDROP_EXCLUSIVE_WEAPONS = ["AWM", "Groza", "Mk14"]
+AIRDROP_CRATE_TABLE = [
+    ("AWM", 1, 1, 1), ("Groza", 1, 1, 1), ("Mk14", 1, 1, 1),
+    (".300 Magnum", 20, 1, 5), ("7.62mm", 30, 1, 5),
+    ("level_3_helmet", 1, 1, 4), ("level_3_vest", 1, 1, 4),
+    ("backpack_level_3", 1, 1, 3), ("med_kit", 1, 20, 4),
+    ("adrenaline_syringe", 1, 10, 3), ("ghillie_suit", 1, 1, 2),
+]
+AIRDROP_SESSIONS = {}
+
+def _airdrop_crate_contents():
+    # Every crate has exactly one exclusive weapon; the remaining contents are randomized.
+    weapon = random.choice(AIRDROP_EXCLUSIVE_WEAPONS)
+    contents = [{"item_id": weapon, "quantity": 1, "weight": 1, "exclusive": True}]
+    pool = [entry for entry in AIRDROP_CRATE_TABLE if entry[0] not in AIRDROP_EXCLUSIVE_WEAPONS]
+    for _ in range(random.randint(3, 6)):
+        item_id, quantity, weight, chance = random.choices(pool, weights=[x[3] for x in pool], k=1)[0]
+        contents.append({"item_id": item_id, "quantity": quantity, "weight": weight, "exclusive": False})
+    return contents
+
+class AirdropPlaneInput(BaseModel):
+    drop_count: int = Field(default=2, ge=1, le=5)
+
+@app.get("/airdrops/config")
+def airdrop_config():
+    return {
+        "aircraft": "supply_plane",
+        "plane_route": "random_edge_to_edge",
+        "drop_count_per_flight": {"min": 1, "max": 5, "default": 2},
+        "exclusive_weapons": AIRDROP_EXCLUSIVE_WEAPONS,
+        "exclusive_rule": "AWM, Groza and Mk14 spawn only in supply-drop crates, never in building loot.",
+        "crate_contents": "One random exclusive weapon plus randomized high-tier gear, ammo and supplies.",
+        "note": "Classic-era inspired prototype. Aircraft visuals, flight audio, parachute animation and crate smoke require UE4 client implementation."
+    }
+
+@app.post("/match/{match_id}/airdrops/plane")
+def spawn_supply_plane(match_id: str, data: AirdropPlaneInput):
+    if not match_id or len(match_id) > 64:
+        raise HTTPException(400, "Invalid match_id")
+    if match_id in AIRDROP_SESSIONS:
+        raise HTTPException(409, "Supply plane already spawned for this match")
+    # Random edge-to-edge flight path within the prototype 8km map bounds.
+    edge_a = random.choice(["north", "south", "east", "west"])
+    edge_b = random.choice([x for x in ["north", "south", "east", "west"] if x != edge_a])
+    def edge_point(edge):
+        if edge == "north": return {"x": random.uniform(-3500,3500), "y": 4000, "z": 1500}
+        if edge == "south": return {"x": random.uniform(-3500,3500), "y": -4000, "z": 1500}
+        if edge == "east": return {"x": 4000, "y": random.uniform(-3500,3500), "z": 1500}
+        return {"x": -4000, "y": random.uniform(-3500,3500), "z": 1500}
+    start, end = edge_point(edge_a), edge_point(edge_b)
+    drops = []
+    for index in range(data.drop_count):
+        t = (index + 1) / (data.drop_count + 1)
+        position = {
+            "x": round(start["x"] + (end["x"]-start["x"])*t + random.uniform(-250,250), 2),
+            "y": round(start["y"] + (end["y"]-start["y"])*t + random.uniform(-250,250), 2),
+            "z": 0
+        }
+        drop_id = f"{match_id}:airdrop:{uuid.uuid4().hex[:10]}"
+        contents = _airdrop_crate_contents()
+        crate = {"airdrop_id": drop_id, "match_id": match_id, "position": position,
+                 "status": "landed", "contents": contents, "opened": False}
+        AIRDROP_SESSIONS.setdefault(match_id, []).append(crate)
+        drops.append({"airdrop_id": drop_id, "position": position, "status": "landed"})
+    flight = {"match_id": match_id, "aircraft": "supply_plane", "status": "flight_path_generated",
+              "start": start, "end": end, "drops": drops}
+    return flight
+
+@app.get("/match/{match_id}/airdrops")
+def list_supply_drops(match_id: str):
+    drops = AIRDROP_SESSIONS.get(match_id, [])
+    return {"match_id": match_id, "count": len(drops),
+            "airdrops": [{"airdrop_id": d["airdrop_id"], "position": d["position"],
+                          "status": d["status"], "opened": d["opened"]} for d in drops]}
+
+@app.get("/match/{match_id}/airdrop/{airdrop_id}")
+def get_supply_crate(match_id: str, airdrop_id: str):
+    crate = next((d for d in AIRDROP_SESSIONS.get(match_id, []) if d["airdrop_id"] == airdrop_id), None)
+    if crate is None:
+        raise HTTPException(404, "Airdrop crate not found")
+    return crate
+
+@app.post("/match/{match_id}/airdrop/{airdrop_id}/open")
+def open_supply_crate(match_id: str, airdrop_id: str):
+    crate = next((d for d in AIRDROP_SESSIONS.get(match_id, []) if d["airdrop_id"] == airdrop_id), None)
+    if crate is None:
+        raise HTTPException(404, "Airdrop crate not found")
+    if crate["opened"]:
+        raise HTTPException(409, "Airdrop crate already looted")
+    crate["opened"] = True
+    crate["status"] = "looted"
+    return {"status": "crate_opened", "airdrop_id": airdrop_id, "contents": crate["contents"]}
