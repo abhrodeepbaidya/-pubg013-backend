@@ -196,6 +196,7 @@ class FireInput(BaseModel):
     hit_zone: Literal["head","chest","stomach","arms","legs"]
     distance_m: float = Field(ge=0,le=2000)
     client_shot_id: str = Field(min_length=1,max_length=64)
+    weapon_slot: Literal["primary_1","primary_2","pistol"] = "primary_1"
 
 @router.post("/matches/{match_id}/combat/fire")
 def validate_fire(match_id: str, data: FireInput):
@@ -204,6 +205,19 @@ def validate_fire(match_id: str, data: FireInput):
     if data.weapon_id not in WEAPON_RULES: raise HTTPException(400,"Weapon has no configured server profile")
     rules=WEAPON_RULES[data.weapon_id]
     now=time.time()
+    # Consume ammunition from the persisted equipped weapon before applying damage.
+    with connect() as con:
+        player_row=con.execute("SELECT state_json FROM players WHERE player_id=?",(data.shooter_id,)).fetchone()
+        if player_row is None:
+            raise HTTPException(404,"Shooter player profile not found")
+        player_state=json.loads(player_row["state_json"])
+        equipped=player_state.get("weapons",{}).get(data.weapon_slot)
+        if not equipped or equipped.get("weapon_id") != data.weapon_id:
+            raise HTTPException(400,"Weapon is not equipped in the requested slot")
+        if int(equipped.get("ammo",0)) <= 0:
+            raise HTTPException(409,"Magazine empty")
+        equipped["ammo"]=int(equipped["ammo"])-1
+        con.execute("UPDATE players SET state_json=? WHERE player_id=?",(json.dumps(player_state),data.shooter_id))
     with connect() as con:
         con.execute("BEGIN IMMEDIATE")
         shooter=con.execute("SELECT * FROM combat_state WHERE match_id=? AND player_id=?",(match_id,data.shooter_id)).fetchone()
@@ -225,7 +239,7 @@ def validate_fire(match_id: str, data: FireInput):
         con.execute("UPDATE combat_state SET health=?,alive=? WHERE match_id=? AND player_id=?",
                     (health,int(health>0),match_id,data.target_id))
     return {"status":"validated_prototype","shot_id":data.client_shot_id,"damage":damage,"target_health":health,
-            "eliminated":health<=0,"ammo_validation":"not yet bound to equipped player inventory",
+            "eliminated":health<=0,"ammo_validation":"equipped slot checked and one round consumed",
             "hit_validation":"client-supplied hit zone/distance are not authoritative; integrate server rewind and raycast"}
 
 class VehicleSpawn(BaseModel):
