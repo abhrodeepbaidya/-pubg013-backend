@@ -1763,3 +1763,7 @@ def get_death_crate(match_id: str, crate_id: str):
 from matchmaking import router as matchmaking_router
 
 app.include_router(matchmaking_router)
+
+from weapon_audio_profiles import router as weapon_audio_profiles_router
+
+app.include_router(weapon_audio_profiles_router)
