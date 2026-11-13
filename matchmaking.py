@@ -158,7 +158,7 @@ def join_queue(data: QueueJoinInput):
                 (match_id, data.mode, data.perspective, data.region.lower(), "ready", target, now),
             )
             for index, queued in enumerate(player_ids):
-                team_id = (index // 2) if data.mode == "classic" else (index // 4)
+                team_id = index // 4
                 con.execute(
                     "INSERT INTO live_match_players(match_id,player_id,team_id,joined_at) VALUES(?,?,?,?)",
                     (match_id, queued, team_id, now),
