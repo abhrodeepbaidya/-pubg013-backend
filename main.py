@@ -1767,3 +1767,8 @@ app.include_router(matchmaking_router)
 from weapon_audio_profiles import router as weapon_audio_profiles_router
 
 app.include_router(weapon_audio_profiles_router)
+
+
+from multiplayer import router as multiplayer_router
+
+app.include_router(multiplayer_router)
