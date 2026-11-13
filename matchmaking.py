@@ -187,6 +187,7 @@ def join_queue(data: QueueJoinInput):
         humans = [row["player_id"] for row in waiting]
         bot_ids = [f"bot-{uuid.uuid4().hex[:12]}" for _ in range(CLASSIC_BOT_PLAYERS)] if data.mode == "classic" else []
         roster = humans + bot_ids
+        random.shuffle(roster)  # Mix humans and bots across four-player squads.
         total = len(roster)
         con.execute(
             "INSERT INTO live_matches(match_id,mode,perspective,region,status,target_players,created_at) "
