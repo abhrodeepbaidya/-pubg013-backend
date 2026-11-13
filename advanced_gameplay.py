@@ -138,19 +138,46 @@ def pickup_loot(match_id: str, data: LootAction):
         raise HTTPException(400,"Invalid player position")
     with connect() as con:
         con.execute("BEGIN IMMEDIATE")
-        row=con.execute("SELECT * FROM world_loot WHERE loot_id=? AND match_id=? AND state='ground'",(data.loot_id,match_id)).fetchone()
+        if con.execute("SELECT 1 FROM live_match_players WHERE match_id=? AND player_id=?",
+                       (match_id,data.player_id)).fetchone() is None:
+            raise HTTPException(403,"Player is not in this match")
+        row=con.execute("SELECT * FROM world_loot WHERE loot_id=? AND match_id=? AND state='ground'",
+                        (data.loot_id,match_id)).fetchone()
         if row is None: raise HTTPException(404,"Loot unavailable or already collected")
         if math.dist((data.x,data.y),(row["x"],row["y"]))>5:
             raise HTTPException(400,"Player is too far from loot")
         if data.quantity>row["quantity"]: raise HTTPException(400,"Requested quantity exceeds ground stack")
+        player=con.execute("SELECT state_json FROM players WHERE player_id=?",(data.player_id,)).fetchone()
+        if player is None: raise HTTPException(404,"Player profile not found")
+        state=json.loads(player["state_json"])
+        state.setdefault("items",[])
+        item_id=row["item_id"]
+        # Ground weapon pickups require a weapon-slot selection flow; do not silently
+        # store a gun as a generic consumable.
+        if item_id in WEAPON_RULES:
+            raise HTTPException(409,"Weapon pickup requires the equip-slot flow")
+        from main import ITEM_WEIGHTS, BASE_CAPACITY, BACKPACK_CAPACITY, VEST_CAPACITY
+        weight=ITEM_WEIGHTS.get(item_id,1)
+        current=sum(int(i.get("quantity",0))*int(i.get("weight",0)) for i in state["items"])
+        capacity=BASE_CAPACITY+BACKPACK_CAPACITY.get(int(state.get("backpack_level",0)),0)+VEST_CAPACITY.get(int(state.get("vest_level",0)),0)
+        if current+weight*data.quantity>capacity:
+            raise HTTPException(409,"Not enough inventory capacity")
+        stack=next((i for i in state["items"] if i.get("item_id")==item_id),None)
+        if stack:
+            stack["quantity"]=int(stack.get("quantity",0))+data.quantity
+        else:
+            state["items"].append({"item_id":item_id,"quantity":data.quantity,"weight":weight})
+        con.execute("UPDATE players SET state_json=? WHERE player_id=?",(json.dumps(state),data.player_id))
         remaining=row["quantity"]-data.quantity
         if remaining:
-            con.execute("UPDATE world_loot SET quantity=? WHERE loot_id=?",(remaining,data.loot_id))
+            con.execute("UPDATE world_loot SET quantity=?,updated_at=? WHERE loot_id=?",(remaining,time.time(),data.loot_id))
         else:
-            con.execute("UPDATE world_loot SET state='picked_up',owner_id=?,updated_at=? WHERE loot_id=?",(data.player_id,time.time(),data.loot_id))
+            con.execute("UPDATE world_loot SET state='picked_up',owner_id=?,updated_at=? WHERE loot_id=?",
+                        (data.player_id,time.time(),data.loot_id))
         con.execute("INSERT INTO player_inventory_events VALUES(?,?,?,?,?,?)",
-                    (uuid.uuid4().hex,match_id,data.player_id,"pickup",json.dumps({"loot_id":data.loot_id,"item_id":row["item_id"],"quantity":data.quantity}),time.time()))
-    return {"status":"picked_up","item_id":row["item_id"],"quantity":data.quantity}
+                    (uuid.uuid4().hex,match_id,data.player_id,"pickup",
+                     json.dumps({"loot_id":data.loot_id,"item_id":item_id,"quantity":data.quantity}),time.time()))
+    return {"status":"picked_up","item_id":item_id,"quantity":data.quantity}
 
 class DropLoot(BaseModel):
     player_id: str = Field(min_length=1,max_length=64)
@@ -166,6 +193,20 @@ def drop_loot(match_id: str, data: DropLoot):
         raise HTTPException(400,"Invalid drop position")
     loot_id="loot-"+uuid.uuid4().hex[:16]
     with connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        if con.execute("SELECT 1 FROM live_match_players WHERE match_id=? AND player_id=?",
+                       (match_id,data.player_id)).fetchone() is None:
+            raise HTTPException(403,"Player is not in this match")
+        player=con.execute("SELECT state_json FROM players WHERE player_id=?",(data.player_id,)).fetchone()
+        if player is None: raise HTTPException(404,"Player profile not found")
+        state=json.loads(player["state_json"])
+        stack=next((i for i in state.get("items",[]) if i.get("item_id")==data.item_id),None)
+        if stack is None or int(stack.get("quantity",0))<data.quantity:
+            raise HTTPException(409,"Insufficient item quantity to drop")
+        stack["quantity"]=int(stack["quantity"])-data.quantity
+        if stack["quantity"]==0:
+            state["items"].remove(stack)
+        con.execute("UPDATE players SET state_json=? WHERE player_id=?",(json.dumps(state),data.player_id))
         con.execute("INSERT INTO world_loot VALUES(?,?,?,?,?,?,?,'ground',NULL,?)",
                     (loot_id,match_id,data.item_id,data.quantity,data.x,data.y,data.z,time.time()))
         con.execute("INSERT INTO player_inventory_events VALUES(?,?,?,?,?,?)",
