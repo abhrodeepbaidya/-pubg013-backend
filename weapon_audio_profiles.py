@@ -1,8 +1,8 @@
 """Classic-era-inspired weapon fire/audio metadata for the UE4 client.
 
 RPM values are provisional tuning estimates, not verified PUBG Mobile 0.13.0
-extracted data. Sound event names are integration hooks; actual licensed/
-authorized audio assets must be supplied by the client project.
+extracted data. Fire modes are weapon-specific. Sound event names are integration
+hooks; actual licensed/authorized audio assets must be supplied by the client.
 """
 from fastapi import APIRouter, HTTPException
 
@@ -24,24 +24,24 @@ PROFILES = {
     "Tommy Gun": (700, ["single", "auto"], 3.45),
     "Kar98k": (0, ["single"], 2.3),
     "M24": (0, ["single"], 1.8),
-    "AWM": (NA, ["single"], 4.6),
-    "Win94": (NA, ["single"], 0.6),
-    "Mini14": (NA, ["single"], 3.0),
-    "SKS": (NA, ["single"], 2.9),
+    "AWM": (None, ["single"], 4.6),
+    "Win94": (None, ["single"], 0.6),
+    "Mini14": (None, ["single"], 3.0),
+    "SKS": (None, ["single"], 2.9),
     "Mk14": (750, ["single", "auto"], 3.0),
-    "QBU": (NA, ["single"], 3.0),
+    "QBU": (None, ["single"], 3.0),
     "DP-28": (550, ["single", "auto"], 5.5),
     "M249": (750, ["auto"], 5.7),
-    "S1897": (NA, ["single"], 4.0),
-    "S686": (NA, ["single"], 3.0),
-    "S12K": (NA, ["single"], 3.0),
-    "P92": (NA, ["single"], 1.8),
+    "S1897": (None, ["single"], 4.0),
+    "S686": (None, ["single"], 3.0),
+    "S12K": (None, ["single"], 3.0),
+    "P92": (None, ["single"], 1.8),
     "P18C": (1000, ["single", "auto"], 2.0),
-    "P1911": (NA, ["single"], 1.9),
-    "R1895": (NA, ["single"], 2.0),
-    "R45": (NA, ["single"], 3.2),
-    "Sawed-off": (NA, ["single"], 2.1),
-    "Crossbow": (NA, ["single"], 3.7),
+    "P1911": (None, ["single"], 1.9),
+    "R1895": (None, ["single"], 2.0),
+    "R45": (None, ["single"], 3.2),
+    "Sawed-off": (None, ["single"], 2.1),
+    "Crossbow": (None, ["single"], 3.7),
 }
 
 def _profile(weapon_id: str, row: tuple):
@@ -52,6 +52,10 @@ def _profile(weapon_id: str, row: tuple):
         "fire_rate_rpm": rpm if rpm else None,
         "fire_interval_ms": round(60000 / rpm, 2) if rpm else None,
         "fire_modes": modes,
+        "default_fire_mode": "auto" if "auto" in modes else ("burst" if "burst" in modes else "single"),
+        "supports_single": "single" in modes,
+        "supports_auto": "auto" in modes,
+        "supports_burst": "burst" in modes,
         "reload_seconds": reload_seconds,
         "audio_events": {
             "fire": f"weapon.{weapon_id}.fire",
