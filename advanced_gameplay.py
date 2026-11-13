@@ -27,7 +27,7 @@ WEAPON_RULES = {
     "SCAR-L": {"damage": 41, "rpm": 600, "mag": 30, "range": 500},
     "M16A4": {"damage": 43, "rpm": 800, "mag": 30, "range": 550},
     "UMP9": {"damage": 39, "rpm": 600, "mag": 30, "range": 300},
-    "UMP45": {"damage":  ум, "rpm": 600, "mag": 25, "range": 300},
+    "UMP45": {"damage": 39, "rpm": 600, "mag": 25, "range": 300},
     "UZI": {"damage": 26, "rpm": 1200, "mag": 25, "range": 150},
     "Vector": {"damage": 31, "rpm": 1200, "mag": 19, "range": 200},
     "Kar98k": {"damage": 75, "rpm": 40, "mag": 5, "range": 800},
