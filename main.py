@@ -196,6 +196,8 @@ class RegisterInput(BaseModel):
 @app.on_event("startup")
 def startup():
     init_db()
+    from advanced_gameplay import init as init_advanced_gameplay_db
+    init_advanced_gameplay_db()
 
 
 @app.get("/")
