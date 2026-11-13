@@ -1759,3 +1759,7 @@ def get_death_crate(match_id: str, crate_id: str):
     if crate is None or crate["match_id"] != match_id:
         raise HTTPException(404, "Death crate not found")
     return crate
+
+from matchmaking import router as matchmaking_router
+
+app.include_router(matchmaking_router)
